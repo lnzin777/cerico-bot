@@ -1,0 +1,11 @@
+{
+  "shopPanel": {
+    "title": "🛒 LOJA OFICIAL – VENDA DE PONTOS",
+    "description": "🎮 Aqui você pode comprar pontos no jogo de forma segura.\n\n📌 **IMPORTANTE – LEIA ANTES DE ABRIR O TICKET:**\n- Os **pontos no jogo serão convertidos em até 24 horas**\n- O prazo começa a contar **após o envio do comprovante**\n- Tickets abertos sem comprovante **não entram na fila**\n\n👇 Para continuar, clique no botão abaixo:",
+    "buttonText": "Abrir Ticket de Compra",
+    "footer": "Ao clicar no botão, você confirma que leu as regras acima."
+  },
+  "ticket": {
+    "welcomeText": "Bem-vindo! ✅\n\n**Passo 1:** Clique em **Enviar dados do pedido**.\n**Passo 2:** Envie o **comprovante** aqui (imagem ou PDF).\n\n⏱️ **Prazo:** pontos convertidos em até **24 horas** após envio do comprovante."
+  }
+}
