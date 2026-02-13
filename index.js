@@ -36,7 +36,10 @@ console.log("🚀 INDEX CARREGADO:", __filename, "PID:", process.pid);
 // ===================== ENV HELPERS =====================
 function requireEnv(name) {
   const v = (process.env[name] || "").trim();
-  if (!v) throw new Error(`Faltou ${name} nas variáveis de ambiente (Render/Windows .env).`);
+  if (!v) {
+    console.error("❌ VARIÁVEL AUSENTE:", name);
+    process.exit(1);
+  }
   return v;
 }
 function optionalEnv(name, fallback = "") {
