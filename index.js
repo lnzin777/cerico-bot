@@ -67,7 +67,6 @@ const CONFIG = Object.freeze({
 
   // Mercado Pago (PROD)
   MP_ACCESS_TOKEN: requireEnv("MP_ACCESS_TOKEN"),
-  MP_WEBHOOK_SECRET: optionalEnv("MP_WEBHOOK_SECRET", ""), // recomendado
   MP_NOTIFICATION_URL: optionalEnv("MP_NOTIFICATION_URL", ""), // recomendado (sua URL do Render)
 
   // Entrega (sua API)
