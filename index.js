@@ -37,11 +37,12 @@ console.log("🚀 INDEX CARREGADO:", __filename, "PID:", process.pid);
 function requireEnv(name) {
   const v = (process.env[name] || "").trim();
   if (!v) {
-    console.error("❌ VARIÁVEL AUSENTE:", name);
+    console.error("❌ VARIÁVEL AUSENTE NO RENDER:", name);
     process.exit(1);
   }
   return v;
 }
+
 function optionalEnv(name, fallback = "") {
   const v = (process.env[name] || "").trim();
   return v || fallback;
