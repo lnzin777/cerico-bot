@@ -105,7 +105,8 @@ if (CONFIG.SUPPORT_ROLE_ID && !isSnowflake(CONFIG.SUPPORT_ROLE_ID)) console.warn
 
 // ===================== COINS / PACKS =====================
 // NOVO: 1 coin = R$ 1,06
-const COIN_BASE_BRL = 1.06;
+const COIN_BASE_BRL = 1.00;
+
 
 // Regras pedidas:
 // - packs: 5, 10, 25, 50, 100, 500
@@ -115,9 +116,9 @@ const COIN_BASE_BRL = 1.06;
 
 const PACK_DEFS = Object.freeze([
   { id: "c5", coins: 5, discountPct: 0.0 },
-  { id: "c10", coins: 10, discountPct: 0.005 },   // 0,5%
-  { id: "c25", coins: 25, discountPct: 0.01 },    // 1,0%
-  { id: "c50", coins: 50, discountPct: 0.015 },   // 1,5%
+  { id: "c10", coins: 10, discountPct: 0.00 },   // 0,5%
+  { id: "c25", coins: 25, discountPct: 0.0 },    // 1,0%
+  { id: "c50", coins: 50, discountPct: 0.0 },   // 1,5%
   { id: "c100", coins: 100, discountPct: 0.025 }, // 2,5%
   { id: "c500", coins: 500, discountPct: 0.05 },  // 5,0%
 ]);
