@@ -499,9 +499,7 @@ async function getPayment(paymentId) {
 }
 
 // Validação assinatura webhook (opcional)
-function verifyMpSignature() {
-  return true;
-}
+
  {
   if (!CONFIG.MP_WEBHOOK_SECRET) return true;
 
@@ -1081,7 +1079,7 @@ async function handleButton(interaction) {
           )
           .catch(() => {});
 
-        await sendPurchaseLog({
+              await sendPurchaseLog({
           mode: "PROD",
           status: "PENDING",
           buyerId: interaction.user.id,
@@ -1094,11 +1092,14 @@ async function handleButton(interaction) {
           timestamp: now(),
         });
 
-        return; // já respondeu via replyEphemeral antes
-         } finally {
-        // solta lock (mesmo com erro)
+        return; // já respondeu
+      } finally {
+        // NÃO soltar lock aqui. Ele expira sozinho (anti clique duplo).
+        // Se soltar, volta a duplicar pack.
       }
     }
+
+
 
     return replyEphemeral("⚠️ Botão desconhecido/antigo. Abra um ticket novo no painel.");
   } catch (err) {
