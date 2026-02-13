@@ -33,8 +33,6 @@ const Database = require("better-sqlite3");
 process.on("unhandledRejection", (err) => console.error("UNHANDLED REJECTION:", err));
 process.on("uncaughtException", (err) => console.error("UNCAUGHT EXCEPTION:", err));
 console.log("🚀 INDEX CARREGADO:", __filename, "PID:", process.pid);
-console.log("🔎 MP signature check:", (CONFIG.MP_WEBHOOK_SECRET ? "ON" : "OFF"));
-
 // ===================== ENV HELPERS =====================
 function requireEnv(name) {
   const v = (process.env[name] || "").trim();
@@ -103,7 +101,7 @@ const PACKS = Object.freeze([
   { id: "p100", label: "100 pontos", emoji: "🟠", price: 20.0 },
   { id: "p250", label: "250 pontos", emoji: "🔴", price: 45.0 },
 ]);
-
+console.log("🔎 MP signature check:", (CONFIG.MP_WEBHOOK_SECRET ? "ON" : "OFF"));
 function brl(v) {
   return `R$ ${Number(v).toFixed(2).replace(".", ",")}`;
 }
