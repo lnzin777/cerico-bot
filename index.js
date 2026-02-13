@@ -101,7 +101,6 @@ const PACKS = Object.freeze([
   { id: "p100", label: "100 pontos", emoji: "🟠", price: 20.0 },
   { id: "p250", label: "250 pontos", emoji: "🔴", price: 45.0 },
 ]);
-console.log("🔎 MP signature check:", (CONFIG.MP_WEBHOOK_SECRET ? "ON" : "OFF"));
 function brl(v) {
   return `R$ ${Number(v).toFixed(2).replace(".", ",")}`;
 }
@@ -1329,7 +1328,15 @@ function startWebhookServer() {
 }
 
 // ===================== START =====================
+console.log("🧪 Antes do lock");
 tryAcquireInstanceLockOrExit();
+console.log("🧪 Depois do lock");
+
 startInstanceHeartbeat();
+console.log("🧪 Depois do heartbeat");
+
 startWebhookServer();
+console.log("🧪 Depois do webhook server");
+
 client.login(CONFIG.DISCORD_TOKEN);
+console.log("🧪 Depois do login");
