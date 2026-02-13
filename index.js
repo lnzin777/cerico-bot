@@ -28,6 +28,7 @@ const express = require("express");
 const axios = require("axios");
 const crypto = require("crypto");
 const Database = require("better-sqlite3");
+console.log("🧪 Testando SQLite...");
 
 // ===================== BOOT / ERROS GLOBAIS =====================
 process.on("unhandledRejection", (err) => console.error("UNHANDLED REJECTION:", err));
@@ -123,6 +124,7 @@ const client = new Client({
 
 // ===================== SQLITE =====================
 const db = new Database("./loja.sqlite");
+console.log("🧪 SQLite carregado com sucesso");
 
 // --- Lock de instância (anti múltiplas instâncias) ---
 db.exec(`
