@@ -725,7 +725,10 @@ async function closeTicketChannel(channel, reasonText = "Ticket fechado.") {
 // ===================== BOTÕES =====================
 async function handleButton(interaction) {
   const { ensureDeferReply, respond } = createSafeResponder(interaction);
-  await ensureDeferReply();
+try {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+} catch {}
+
 
   try {
     const customId = interaction.customId;
@@ -759,6 +762,13 @@ async function handleButton(interaction) {
 
     if (customId.startsWith("pack:")) {
       if (!isBuyer) return respond("⚠️ Só quem abriu o ticket pode escolher o pack.");
+// ACK imediato (sem depender do helper)
+try {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+} catch {}
+
+// responde rápido pra evitar thinking infinito
+await interaction.editReply({ content: "⏳ Gerando link de pagamento..." });
 
       const packId = customId.split(":")[1];
       const pack = PACKS.find((p) => p.id === packId);
