@@ -860,53 +860,74 @@ async function handleButton(interaction) {
 // ===================== COMMANDS =====================
 async function handleCommand(interaction) {
   const { ensureDeferReply, respond } = createSafeResponder(interaction);
-  await ensureDeferReply();
 
   try {
-    const channel = interaction.channel;
-
-    if (interaction.commandName === "setnick") {
-      const nick = interaction.options.getString("nick", true).trim();
-      if (!nick || nick.length < 2) return respond("❌ Nick inválido.");
-
-      const current = stmtGetProfile.get(interaction.user.id) || { nick: "", email: "" };
-      stmtUpsertProfile.run({ discord_id: interaction.user.id, nick, email: current.email || "", updated_at: now() });
-
-      if (channel && isTicketChannel(channel)) {
-        const topicObj = parseTopic(channel.topic || "");
-        if (topicObj.buyer && topicObj.buyer !== interaction.user.id) return respond("⚠️ Só o comprador pode alterar.");
-        topicObj.nick = nick;
-        await channel.setTopic(buildTopic(topicObj)).catch(() => {});
-        resetInactivityTimer(channel);
-      }
-
-      return respond(`✅ Nick atualizado para **${nick}**.`);
-    }
+    await ensureDeferReply();
 
     if (interaction.commandName === "setemail") {
       const email = interaction.options.getString("email", true).trim();
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return respond("❌ Email inválido.");
 
-      const current = stmtGetProfile.get(interaction.user.id) || { nick: "", email: "" };
-      stmtUpsertProfile.run({ discord_id: interaction.user.id, nick: current.nick || "", email, updated_at: now() });
-
-      if (channel && isTicketChannel(channel)) {
-        const topicObj = parseTopic(channel.topic || "");
-        if (topicObj.buyer && topicObj.buyer !== interaction.user.id) return respond("⚠️ Só o comprador pode alterar.");
-        topicObj.email = email;
-        await channel.setTopic(buildTopic(topicObj)).catch(() => {});
-        resetInactivityTimer(channel);
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return await respond("❌ Email inválido.");
       }
 
-      return respond(`✅ Email atualizado para **${email}**.`);
+      const current = stmtGetProfile.get(interaction.user.id) || { nick: "", email: "" };
+
+      stmtUpsertProfile.run({
+        discord_id: interaction.user.id,
+        nick: current.nick || "",
+        email,
+        updated_at: now(),
+      });
+
+      if (interaction.channel && isTicketChannel(interaction.channel)) {
+        const topicObj = parseTopic(interaction.channel.topic || "");
+        if (topicObj.buyer === interaction.user.id) {
+          topicObj.email = email;
+          await interaction.channel.setTopic(buildTopic(topicObj)).catch(() => {});
+        }
+      }
+
+      return await respond(`✅ Email atualizado para **${email}**.`);
     }
 
-    return respond("⚠️ Comando desconhecido.");
+    if (interaction.commandName === "setnick") {
+      const nick = interaction.options.getString("nick", true).trim();
+
+      if (!nick || nick.length < 2) {
+        return await respond("❌ Nick inválido.");
+      }
+
+      const current = stmtGetProfile.get(interaction.user.id) || { nick: "", email: "" };
+
+      stmtUpsertProfile.run({
+        discord_id: interaction.user.id,
+        nick,
+        email: current.email || "",
+        updated_at: now(),
+      });
+
+      if (interaction.channel && isTicketChannel(interaction.channel)) {
+        const topicObj = parseTopic(interaction.channel.topic || "");
+        if (topicObj.buyer === interaction.user.id) {
+          topicObj.nick = nick;
+          await interaction.channel.setTopic(buildTopic(topicObj)).catch(() => {});
+        }
+      }
+
+      return await respond(`✅ Nick atualizado para **${nick}**.`);
+    }
+
+    return await respond("⚠️ Comando desconhecido.");
+
   } catch (err) {
     console.error("❌ handleCommand crash:", err);
-    return respond("❌ Erro interno no comando.");
+    try {
+      return await respond("❌ Erro interno no comando.");
+    } catch {}
   }
 }
+
 
 // ===================== CAPTURA NICK/EMAIL POR MENSAGEM =====================
 client.on("messageCreate", async (msg) => {
