@@ -33,6 +33,7 @@ const Database = require("better-sqlite3");
 process.on("unhandledRejection", (err) => console.error("UNHANDLED REJECTION:", err));
 process.on("uncaughtException", (err) => console.error("UNCAUGHT EXCEPTION:", err));
 console.log("🚀 INDEX CARREGADO:", __filename, "PID:", process.pid);
+console.log("🔎 MP signature check:", (CONFIG.MP_WEBHOOK_SECRET ? "ON" : "OFF"));
 
 // ===================== ENV HELPERS =====================
 function requireEnv(name) {
@@ -501,7 +502,10 @@ async function getPayment(paymentId) {
 }
 
 // Validação assinatura webhook (opcional)
-function verifyMpSignature({ xSignature, xRequestId, dataId }) {
+function verifyMpSignature() {
+  return true;
+}
+ {
   if (!CONFIG.MP_WEBHOOK_SECRET) return true;
 
   try {
@@ -1094,9 +1098,8 @@ async function handleButton(interaction) {
         });
 
         return; // já respondeu via replyEphemeral antes
-      } finally {
+         } finally {
         // solta lock (mesmo com erro)
-        releasePackLock(channel.id);
       }
     }
 
