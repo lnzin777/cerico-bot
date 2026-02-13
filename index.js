@@ -1,17 +1,12 @@
 /**
  * index.js — Discord.js v14 + Tickets + SQLite + Mercado Pago (PROD) Checkout Pro + Webhook + Entrega
- * COINS:
- *  - Packs: 5, 10, 25, 50, 100, 500 coins
- *  - Descontos: <= 2.5% nos menores; 500 coins = 5%
- * PREÇO:
- *  - Calcula preço final pra cobrir taxa MP (pct + fixa) + margem opcional
- *  - Arredonda pra cima em 0.50
- * ANTI-DUPLICAÇÃO:
- *  - Lock de instância via SQLite + heartbeat
- *  - Dedupe por interaction.id
- *  - Lock por ticket/canal no clique do pack
- * CLOSE TICKET:
- *  - Buyer OU SUPPORT_ROLE_ID OU ManageChannels
+ * - Render-ready (usa process.env.PORT)
+ * - Anti-duplicação: Instance lock (SQLite) + dedupe de interação + lock por ticket (pack)
+ * - Fechar ticket: buyer OU SUPPORT_ROLE_ID OU ManageChannels
+ * - Coins: packs 5/10/25/50/100/500
+ * - 1 coin = R$ 1,06 (fixo)
+ * - SEM taxa do Mercado Pago por cima (sem MP_FEE_PCT)
+ * - Arredonda pra cima em R$ 0,50 (configurável)
  */
 
 require("dotenv").config();
@@ -52,17 +47,17 @@ function optionalEnv(name, fallback = "") {
   const v = (process.env[name] || "").trim();
   return v || fallback;
 }
-function now() {
-  return Date.now();
-}
 function isSnowflake(s) {
   return typeof s === "string" && /^[0-9]{17,20}$/.test(s);
 }
-function brl(v) {
-  return `R$ ${Number(v).toFixed(2).replace(".", ",")}`;
+function now() {
+  return Date.now();
 }
-function safeJson(v) {
-  try { return JSON.stringify(v); } catch { return String(v); }
+function ceilToStep(value, step) {
+  const v = Number(value);
+  const s = Number(step);
+  if (!isFinite(v) || !isFinite(s) || s <= 0) return v;
+  return Math.ceil(v / s) * s;
 }
 
 // ===================== CONFIG =====================
@@ -79,19 +74,15 @@ const CONFIG = Object.freeze({
 
   // Mercado Pago (PROD)
   MP_ACCESS_TOKEN: requireEnv("MP_ACCESS_TOKEN"),
-  MP_WEBHOOK_SECRET: optionalEnv("MP_WEBHOOK_SECRET", ""), // se vazio => signature OFF
-  MP_NOTIFICATION_URL: optionalEnv("MP_NOTIFICATION_URL", ""), // recomendado: https://cerico-bot.onrender.com/mp/webhook
+  MP_WEBHOOK_SECRET: optionalEnv("MP_WEBHOOK_SECRET", ""), // se vazio => assinatura OFF
+  MP_NOTIFICATION_URL: optionalEnv("MP_NOTIFICATION_URL", ""), // ex: https://cerico-bot.onrender.com/mp/webhook
+
+  // Arredondamento
+  PRICE_ROUND_STEP: Number(optionalEnv("PRICE_ROUND_STEP", "0.50")),
 
   // Entrega (sua API)
   API_URL: requireEnv("API_URL"),
   API_TOKEN: requireEnv("API_TOKEN"),
-
-  // Pricing
-  COIN_VALUE_BRL: Number(optionalEnv("COIN_VALUE_BRL", "1.00")), // 1 coin = 1 real base
-  MP_FEE_PCT: Number(optionalEnv("MP_FEE_PCT", "0.049")),        // exemplo: 0.049 (4.9%)  <-- ajuste no Render
-  MP_FEE_FIXED: Number(optionalEnv("MP_FEE_FIXED", "0.40")),     // exemplo: 0.40          <-- ajuste no Render
-  MP_MARGIN_PCT: Number(optionalEnv("MP_MARGIN_PCT", "0.00")),   // margem extra (opcional)
-  PRICE_STEP: Number(optionalEnv("PRICE_STEP", "0.50")),         // arredonda pra cima em 0.50
 
   // Timers
   TICKET_COOLDOWN_MS: Number(optionalEnv("TICKET_COOLDOWN_MS", "60000")),
@@ -99,7 +90,7 @@ const CONFIG = Object.freeze({
   DELETE_DELAY_MS: Number(optionalEnv("DELETE_DELAY_MS", "2500")),
   AUTO_CLOSE_AFTER_DELIVERY_MS: Number(optionalEnv("AUTO_CLOSE_AFTER_DELIVERY_MS", "10000")),
 
-  // Locks / dedupe
+  // Locks / Dedupe
   INSTANCE_LOCK_TTL_MS: Number(optionalEnv("INSTANCE_LOCK_TTL_MS", "45000")),
   INSTANCE_HEARTBEAT_MS: Number(optionalEnv("INSTANCE_HEARTBEAT_MS", "15000")),
   INTERACTION_DEDUPE_MS: Number(optionalEnv("INTERACTION_DEDUPE_MS", "12000")),
@@ -109,47 +100,48 @@ const CONFIG = Object.freeze({
   WEBHOOK_PORT_FALLBACK: Number(optionalEnv("WEBHOOK_PORT", "10000")),
 });
 
-if (!isSnowflake(CONFIG.LOG_CHANNEL_ID)) console.warn("⚠️ LOG_CHANNEL_ID parece inválido.");
-if (CONFIG.SUPPORT_ROLE_ID && !isSnowflake(CONFIG.SUPPORT_ROLE_ID)) console.warn("⚠️ SUPPORT_ROLE_ID parece inválido.");
+if (!isSnowflake(CONFIG.LOG_CHANNEL_ID)) console.warn("⚠️ LOG_CHANNEL_ID parece inválido (só números).");
+if (CONFIG.SUPPORT_ROLE_ID && !isSnowflake(CONFIG.SUPPORT_ROLE_ID)) console.warn("⚠️ SUPPORT_ROLE_ID inválido (só números).");
 
-// ===================== COIN PACKS =====================
-const COIN_PACKS = Object.freeze([
-  { id: "c5",   coins: 5,   discountPct: 0.00,  emoji: "🟢" },
-  { id: "c10",  coins: 10,  discountPct: 0.005, emoji: "🟡" }, // 0,5%
-  { id: "c25",  coins: 25,  discountPct: 0.01,  emoji: "🟠" }, // 1%
-  { id: "c50",  coins: 50,  discountPct: 0.015, emoji: "🔴" }, // 1,5%
-  { id: "c100", coins: 100, discountPct: 0.025, emoji: "💠" }, // 2,5% (máx)
-  { id: "c500", coins: 500, discountPct: 0.05,  emoji: "💎" }, // 5%
+// ===================== COINS / PACKS =====================
+// NOVO: 1 coin = R$ 1,06
+const COIN_BASE_BRL = 1.06;
+
+// Regras pedidas:
+// - packs: 5, 10, 25, 50, 100, 500
+// - desconto <= 2,5% nos menores, 5% no de 500
+// - SEM taxa do MP por cima
+// - arredondar pra cima em R$0,50
+
+const PACK_DEFS = Object.freeze([
+  { id: "c5", coins: 5, discountPct: 0.0 },
+  { id: "c10", coins: 10, discountPct: 0.005 },   // 0,5%
+  { id: "c25", coins: 25, discountPct: 0.01 },    // 1,0%
+  { id: "c50", coins: 50, discountPct: 0.015 },   // 1,5%
+  { id: "c100", coins: 100, discountPct: 0.025 }, // 2,5%
+  { id: "c500", coins: 500, discountPct: 0.05 },  // 5,0%
 ]);
 
-function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
-function roundUpToStep(value, step) {
-  const s = step > 0 ? step : 0.5;
-  return Math.ceil(value / s) * s;
+function brl(v) {
+  return `R$ ${Number(v).toFixed(2).replace(".", ",")}`;
 }
 
-/**
- * Calcula preço final para o cliente pagar e você receber o valor alvo.
- * alvo = base_com_desconto * (1 + margem)
- * final = (alvo + taxa_fixa) / (1 - taxa_pct)
- * arredonda pra cima no step (0.50)
- */
-function computeFinalPriceBRL(coins, discountPct) {
-  const base = coins * CONFIG.COIN_VALUE_BRL;
-  const disc = clamp(discountPct, 0, 0.10); // trava segurança 10% se alguém mexer
-  const baseDiscounted = base * (1 - disc);
-
-  const margin = Math.max(CONFIG.MP_MARGIN_PCT, 0);
-  const targetNet = baseDiscounted * (1 + margin);
-
-  const feePct = clamp(CONFIG.MP_FEE_PCT, 0, 0.99);
-  const feeFixed = Math.max(CONFIG.MP_FEE_FIXED, 0);
-
-  const denom = 1 - feePct;
-  const rawFinal = denom > 0 ? (targetNet + feeFixed) / denom : (targetNet + feeFixed);
-
-  return roundUpToStep(rawFinal, CONFIG.PRICE_STEP);
+// Preço final SEM taxa MP em cima
+function priceForCoins({ coins, discountPct }) {
+  const desired = coins * COIN_BASE_BRL * (1 - discountPct);
+  return ceilToStep(desired, CONFIG.PRICE_ROUND_STEP);
 }
+
+const PACKS = Object.freeze(
+  PACK_DEFS.map((d) => ({
+    id: d.id,
+    coins: d.coins,
+    label: `${d.coins} coins`,
+    emoji: "🪙",
+    price: priceForCoins(d),
+    discountPct: d.discountPct,
+  }))
+);
 
 // ===================== DISCORD CLIENT =====================
 const client = new Client({
@@ -169,12 +161,20 @@ db.exec(`
     updated_at INTEGER NOT NULL
   );
 `);
+
 const stmtGetLock = db.prepare(`SELECT * FROM bot_lock WHERE key = ?`);
-const stmtInsertLock = db.prepare(`INSERT INTO bot_lock (key, owner, expires_at, updated_at) VALUES (@key,@owner,@expires_at,@updated_at)`);
-const stmtUpdateLock = db.prepare(`UPDATE bot_lock SET owner=@owner, expires_at=@expires_at, updated_at=@updated_at WHERE key=@key`);
+const stmtInsertLock = db.prepare(`
+  INSERT INTO bot_lock (key, owner, expires_at, updated_at)
+  VALUES (@key, @owner, @expires_at, @updated_at)
+`);
+const stmtUpdateLock = db.prepare(`
+  UPDATE bot_lock SET owner=@owner, expires_at=@expires_at, updated_at=@updated_at
+  WHERE key=@key
+`);
 
 function instanceOwnerId() {
-  return `pid:${process.pid}:${crypto.randomBytes(3).toString("hex")}`;
+  const salt = crypto.randomBytes(3).toString("hex");
+  return `pid:${process.pid}:${salt}`;
 }
 
 const INSTANCE = {
@@ -212,17 +212,13 @@ function startInstanceHeartbeat() {
   if (INSTANCE.heartbeatTimer) clearInterval(INSTANCE.heartbeatTimer);
 
   INSTANCE.heartbeatTimer = setInterval(() => {
-    try {
-      const t = now();
-      const row = stmtGetLock.get(INSTANCE.key);
-      if (!row || row.owner !== INSTANCE.owner) {
-        console.error("🛑 Perdi o lock de instância. Encerrando para evitar duplicação.");
-        process.exit(1);
-      }
-      stmtUpdateLock.run({ key: INSTANCE.key, owner: INSTANCE.owner, expires_at: t + CONFIG.INSTANCE_LOCK_TTL_MS, updated_at: t });
-    } catch (e) {
-      console.error("⚠️ heartbeat lock erro:", e?.message || e);
+    const t = now();
+    const row = stmtGetLock.get(INSTANCE.key);
+    if (!row || row.owner !== INSTANCE.owner) {
+      console.error("🛑 Perdi o lock de instância. Encerrando para evitar duplicação.");
+      process.exit(1);
     }
+    stmtUpdateLock.run({ key: INSTANCE.key, owner: INSTANCE.owner, expires_at: t + CONFIG.INSTANCE_LOCK_TTL_MS, updated_at: t });
   }, CONFIG.INSTANCE_HEARTBEAT_MS);
 }
 
@@ -247,7 +243,6 @@ db.exec(`
     nick TEXT NOT NULL,
     email TEXT NOT NULL,
     pack_id TEXT NOT NULL,
-    coins INTEGER NOT NULL DEFAULT 0,
     amount REAL NOT NULL,
     status TEXT NOT NULL,
     created_at INTEGER NOT NULL,
@@ -268,8 +263,8 @@ const stmtUpsertProfile = db.prepare(`
 `);
 
 const stmtInsertPurchase = db.prepare(`
-  INSERT INTO purchases (order_id, payment_id, preference_id, buyer_id, channel_id, nick, email, pack_id, coins, amount, status, created_at, updated_at)
-  VALUES (@order_id, @payment_id, @preference_id, @buyer_id, @channel_id, @nick, @email, @pack_id, @coins, @amount, @status, @created_at, @updated_at)
+  INSERT INTO purchases (order_id, payment_id, preference_id, buyer_id, channel_id, nick, email, pack_id, amount, status, created_at, updated_at)
+  VALUES (@order_id, @payment_id, @preference_id, @buyer_id, @channel_id, @nick, @email, @pack_id, @amount, @status, @created_at, @updated_at)
 `);
 
 const stmtGetPurchaseByOrder = db.prepare(`SELECT * FROM purchases WHERE order_id = ?`);
@@ -299,10 +294,10 @@ const STATE = {
   packLocks: new Map(),
 };
 
-// ===================== TOPIC HELPERS =====================
+// ===================== HELPERS: TOPIC =====================
 function parseTopic(topic = "") {
   const obj = {};
-  topic
+  String(topic)
     .split(";")
     .map((s) => s.trim())
     .filter(Boolean)
@@ -323,7 +318,11 @@ function isTicketChannel(ch) {
   return ch && ch.type === ChannelType.GuildText && typeof ch.name === "string" && ch.name.startsWith("ticket-");
 }
 function safeChannelNameFromUser(user) {
-  const safe = user.username.toLowerCase().replace(/[^a-z0-9]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
+  const safe = user.username
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
   return `ticket-${safe}-${user.id.slice(-4)}`;
 }
 function makeOrderId(userId) {
@@ -332,7 +331,9 @@ function makeOrderId(userId) {
 
 // ===================== INACTIVITY TIMER =====================
 function cleanupChannelState(channelId) {
-  for (const [uid, chId] of STATE.openTickets.entries()) if (chId === channelId) STATE.openTickets.delete(uid);
+  for (const [uid, chId] of STATE.openTickets.entries()) {
+    if (chId === channelId) STATE.openTickets.delete(uid);
+  }
   const t = STATE.inactivityTimers.get(channelId);
   if (t) clearTimeout(t);
   STATE.inactivityTimers.delete(channelId);
@@ -349,6 +350,7 @@ function resetInactivityTimer(channel) {
     try {
       const fresh = await channel.guild.channels.fetch(channel.id).catch(() => null);
       if (!fresh || !fresh.isTextBased() || !isTicketChannel(fresh)) return;
+
       await fresh.send("⏳ Ticket sem atividade por **10 minutos**. Vou fechar automaticamente.").catch(() => {});
       cleanupChannelState(fresh.id);
       await fresh.delete().catch(() => {});
@@ -362,20 +364,25 @@ function resetInactivityTimer(channel) {
 
 // ===================== SAFE RESPONDER =====================
 function createSafeResponder(interaction) {
-  let triedDefer = false;
+  let tried = false;
 
   async function ensureDefer() {
-    if (interaction.deferred || interaction.replied || triedDefer) return;
-    triedDefer = true;
+    if (interaction.deferred || interaction.replied || tried) return;
+    tried = true;
     try {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     } catch {}
   }
 
-  async function replyEphemeral(content) {
-    const payload = { content: String(content ?? ""), flags: MessageFlags.Ephemeral };
-    if (interaction.deferred) { try { return await interaction.editReply(payload); } catch {} }
-    if (!interaction.replied) { try { return await interaction.reply(payload); } catch {} }
+  async function replyEphemeral(content, extra = {}) {
+    const payload = { content: String(content ?? ""), flags: MessageFlags.Ephemeral, ...extra };
+
+    if (interaction.deferred) {
+      try { return await interaction.editReply(payload); } catch {}
+    }
+    if (!interaction.replied) {
+      try { return await interaction.reply(payload); } catch {}
+    }
     try { return await interaction.followUp(payload); } catch {}
     return null;
   }
@@ -394,20 +401,8 @@ function isDuplicateInteraction(interactionId) {
   return false;
 }
 
-// ===================== LOCK POR TICKET (pack) =====================
-function acquirePackLock(channelId, byUserId) {
-  const t = now();
-  const cur = STATE.packLocks.get(channelId);
-  if (cur && cur.until > t) return { ok: false, waitMs: cur.until - t, by: cur.by };
-  STATE.packLocks.set(channelId, { until: t + CONFIG.PACK_LOCK_MS, by: byUserId });
-  return { ok: true };
-}
-function releasePackLock(channelId) {
-  STATE.packLocks.delete(channelId);
-}
-
 // ===================== LOG =====================
-async function sendPurchaseLog({ status, mode, buyerId, nick, email, packId, coins, amount, orderId, paymentId, timestamp }) {
+async function sendPurchaseLog({ status, mode, buyerId, nick, email, packId, amount, orderId, paymentId, timestamp }) {
   try {
     const guild = await client.guilds.fetch(CONFIG.GUILD_ID).catch(() => null);
     if (!guild) return;
@@ -415,17 +410,16 @@ async function sendPurchaseLog({ status, mode, buyerId, nick, email, packId, coi
     const ch = await guild.channels.fetch(CONFIG.LOG_CHANNEL_ID).catch(() => null);
     if (!ch || !ch.isTextBased()) return;
 
-    const pack = COIN_PACKS.find((p) => p.id === packId);
+    const pack = PACKS.find((p) => p.id === packId);
 
     const content =
-      `🧾 **LOG COMPRA (COINS)**\n` +
+      `🧾 **LOG COMPRA**\n` +
       `• Status: **${status}**\n` +
       `• Modo: **${mode}**\n` +
       `• buyerId: **${buyerId}** (<@${buyerId}>)\n` +
       `• Nick: **${nick || "—"}**\n` +
       `• Email: **${email || "—"}**\n` +
-      `• Pack: **${pack ? `${pack.coins} coins` : packId}**\n` +
-      `• Coins: **${coins ?? pack?.coins ?? "—"}**\n` +
+      `• Pack: **${pack?.label || packId || "—"}**\n` +
       `• Amount: **${amount != null ? brl(amount) : "—"}**\n` +
       `• orderId: **${orderId || "—"}**\n` +
       `• paymentId: **${paymentId || "—"}**\n` +
@@ -438,14 +432,11 @@ async function sendPurchaseLog({ status, mode, buyerId, nick, email, packId, coi
 }
 
 // ===================== ENTREGA (SUA API) =====================
-// compatível com seu backend antigo e novo (manda coins + points)
-async function deliverToGame({ nick, coins, orderId, packId }) {
+async function deliverToGame({ nick, packId, orderId }) {
   const url =
     `${CONFIG.API_URL}?token=${encodeURIComponent(CONFIG.API_TOKEN)}` +
     `&player=${encodeURIComponent(nick)}` +
-    `&coins=${encodeURIComponent(String(coins))}` +
-    `&points=${encodeURIComponent(String(coins))}` +
-    `&pack=${encodeURIComponent(String(packId || ""))}` +
+    `&pack=${encodeURIComponent(packId)}` +
     `&orderId=${encodeURIComponent(orderId)}`;
 
   console.log("🎮 [GAME] chamando API:", url.replace(CONFIG.API_TOKEN, "***"));
@@ -456,30 +447,25 @@ async function deliverToGame({ nick, coins, orderId, packId }) {
 
 // ===================== MERCADO PAGO =====================
 function mpHeaders(extra = {}) {
-  return {
-    Authorization: `Bearer ${CONFIG.MP_ACCESS_TOKEN}`,
-    "Content-Type": "application/json",
-    ...extra,
-  };
+  return { Authorization: `Bearer ${CONFIG.MP_ACCESS_TOKEN}`, "Content-Type": "application/json", ...extra };
 }
 function idempotencyKey() {
   return crypto.randomUUID();
 }
-
-async function createCheckoutPreference({ pack, buyerId, nick, email, orderId, amount }) {
+async function createCheckoutPreference({ pack, buyerId, nick, email, orderId }) {
   const body = {
     items: [
       {
-        title: `Coins - ${pack.coins} coins`,
-        description: `Nick: ${nick} | Coins: ${pack.coins} | Pack: ${pack.id}`,
+        title: `Coins - ${pack.label}`,
+        description: `Nick: ${nick} | Pack: ${pack.id}`,
         quantity: 1,
-        unit_price: Number(amount),
+        unit_price: Number(pack.price),
         currency_id: "BRL",
       },
     ],
     payer: { email },
     external_reference: orderId,
-    metadata: { buyerId, nick, packId: pack.id, coins: pack.coins, orderId },
+    metadata: { buyerId, nick, packId: pack.id, orderId },
   };
 
   if (CONFIG.MP_NOTIFICATION_URL) body.notification_url = CONFIG.MP_NOTIFICATION_URL;
@@ -488,22 +474,16 @@ async function createCheckoutPreference({ pack, buyerId, nick, email, orderId, a
     headers: mpHeaders({ "X-Idempotency-Key": idempotencyKey() }),
     timeout: 15000,
   });
-
   return res.data;
 }
-
 async function getPayment(paymentId) {
-  const res = await axios.get(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
-    headers: mpHeaders(),
-    timeout: 15000,
-  });
+  const res = await axios.get(`https://api.mercadopago.com/v1/payments/${paymentId}`, { headers: mpHeaders(), timeout: 15000 });
   return res.data;
 }
 
-// validação assinatura (se tiver secret)
+// Assinatura MP (ON só se tiver secret)
 function verifyMpSignature({ xSignature, xRequestId, dataId }) {
   if (!CONFIG.MP_WEBHOOK_SECRET) return true;
-
   try {
     if (!xSignature || !xRequestId || !dataId) return false;
 
@@ -530,7 +510,7 @@ function verifyMpSignature({ xSignature, xRequestId, dataId }) {
 // ===================== PROCESSA PAGAMENTO (WEBHOOK) =====================
 async function processPaymentFromWebhook(paymentId) {
   if (STATE.delivering.has(paymentId)) {
-    console.log("🟨 delivery lock ativo p/ paymentId:", paymentId);
+    console.log("🟨 delivery runtime lock ativo p/ paymentId:", paymentId);
     return;
   }
   STATE.delivering.add(paymentId);
@@ -547,6 +527,7 @@ async function processPaymentFromWebhook(paymentId) {
     const orderId = String(payment?.external_reference || "");
 
     console.log("[MP] payment", paymentId, "status", status, "orderId", orderId);
+
     if (!orderId) return;
 
     const purchase = stmtGetPurchaseByOrder.get(orderId);
@@ -555,7 +536,6 @@ async function processPaymentFromWebhook(paymentId) {
       return;
     }
 
-    // atualiza status/payment no DB
     stmtUpdatePurchase.run({
       order_id: orderId,
       payment_id: String(paymentId),
@@ -572,7 +552,6 @@ async function processPaymentFromWebhook(paymentId) {
         nick: purchase.nick,
         email: purchase.email,
         packId: purchase.pack_id,
-        coins: purchase.coins,
         amount: purchase.amount,
         orderId,
         paymentId: String(paymentId),
@@ -581,28 +560,17 @@ async function processPaymentFromWebhook(paymentId) {
       return;
     }
 
-    // idempotência de entrega (DB)
     const refreshed = stmtGetPurchaseByOrder.get(orderId);
     if (refreshed && refreshed.status === "DELIVERED") return;
 
     const channel = await client.channels.fetch(purchase.channel_id).catch(() => null);
     if (channel?.isTextBased()) {
       await channel.send(
-        `✅ Pagamento aprovado!\n` +
-        `🧾 PaymentId: **${paymentId}**\n` +
-        `🧾 Pedido: **${orderId}**\n` +
-        `🪙 Coins: **${purchase.coins}**\n` +
-        `🚀 Enviando para o jogo...`
+        `✅ Pagamento aprovado!\n🧾 PaymentId: **${paymentId}**\n🧾 Pedido: **${orderId}**\n🚀 Enviando para o jogo...`
       ).catch(() => {});
     }
 
-    const result = await deliverToGame({
-      nick: purchase.nick,
-      coins: purchase.coins,
-      orderId,
-      packId: purchase.pack_id,
-    });
-
+    const result = await deliverToGame({ nick: purchase.nick, packId: purchase.pack_id, orderId });
     const ok = result && (result.ok === true || result.success === true);
 
     if (ok) {
@@ -621,7 +589,6 @@ async function processPaymentFromWebhook(paymentId) {
         nick: purchase.nick,
         email: purchase.email,
         packId: purchase.pack_id,
-        coins: purchase.coins,
         amount: purchase.amount,
         orderId,
         paymentId: String(paymentId),
@@ -652,7 +619,6 @@ async function processPaymentFromWebhook(paymentId) {
       nick: purchase.nick,
       email: purchase.email,
       packId: purchase.pack_id,
-      coins: purchase.coins,
       amount: purchase.amount,
       orderId,
       paymentId: String(paymentId),
@@ -660,7 +626,7 @@ async function processPaymentFromWebhook(paymentId) {
     });
 
     if (channel?.isTextBased()) {
-      await channel.send(`❌ Erro na entrega: \`${safeJson(result)}\``).catch(() => {});
+      await channel.send(`❌ Erro na entrega: \`${String(JSON.stringify(result)).slice(0, 1500)}\``).catch(() => {});
     }
   } catch (e) {
     console.log("❌ processPaymentFromWebhook erro:", e?.response?.data || e?.message || e);
@@ -671,14 +637,22 @@ async function processPaymentFromWebhook(paymentId) {
 
 // ===================== UI: PAINEL + PACKS =====================
 function buildPanelMessage() {
+  const lines = PACKS.map((p) => {
+    const disc = Math.round(p.discountPct * 1000) / 10;
+    return `• ${p.emoji} **${p.label}** → **${brl(p.price)}** ${disc > 0 ? `(desconto ~${disc}%)` : ""}`;
+  }).join("\n");
+
   const embed = new EmbedBuilder()
-    .setTitle("🛒 Loja de Coins (Mercado Pago)")
+    .setTitle("🛒 Loja (Coins) — Checkout Pro")
     .setDescription(
       "Clique no botão abaixo para abrir um ticket.\n\n" +
       "📌 No ticket:\n" +
       "1) Envie seu **nick** (primeira mensagem salva automaticamente)\n" +
       "2) Envie seu **email** (necessário pro pagamento) ou use /setemail\n" +
-      "3) Escolha o pack de **coins** e pague pelo link"
+      "3) Escolha o pack e pague pelo link\n\n" +
+      `🪙 **1 coin = ${brl(COIN_BASE_BRL)}**\n\n` +
+      `💰 **Packs:**\n${lines}\n\n` +
+      `📌 *Preço arredondado pra cima em ${brl(CONFIG.PRICE_ROUND_STEP)}.*`
     );
 
   const row = new ActionRowBuilder().addComponents(
@@ -692,13 +666,10 @@ function buildPackRows(disabled = false) {
   const rows = [];
   let current = new ActionRowBuilder();
 
-  for (const p of COIN_PACKS) {
-    const amount = computeFinalPriceBRL(p.coins, p.discountPct);
-    const label = `${p.emoji} ${p.coins} coins (${brl(amount)})`;
-
+  for (const p of PACKS) {
     const btn = new ButtonBuilder()
       .setCustomId(`pack:${p.id}`)
-      .setLabel(label)
+      .setLabel(`${p.emoji} ${p.label} (${brl(p.price)})`)
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(disabled);
 
@@ -754,6 +725,7 @@ async function registerSlashCommands() {
       .setDescription("Define/atualiza seu nick para entrega.")
       .addStringOption((opt) => opt.setName("nick").setDescription("Seu nick no jogo").setRequired(true))
       .toJSON(),
+
     new SlashCommandBuilder()
       .setName("setemail")
       .setDescription("Define/atualiza seu email para pagamento.")
@@ -791,7 +763,9 @@ function canCloseTicket(interaction, buyerId) {
   if (member.permissions?.has(PermissionFlagsBits.ManageChannels)) return true;
 
   if (CONFIG.SUPPORT_ROLE_ID) {
-    try { if (member.roles?.cache?.has(CONFIG.SUPPORT_ROLE_ID)) return true; } catch {}
+    try {
+      if (member.roles?.cache?.has(CONFIG.SUPPORT_ROLE_ID)) return true;
+    } catch {}
   }
   return false;
 }
@@ -817,7 +791,7 @@ async function createTicketChannel({ guild, user }) {
 
   const genKey = `GEN:${user.id}`;
   if (STATE.generatingTicket.has(genKey)) {
-    return { ok: false, reason: "Estou criando seu ticket… aguarde e tente de novo." };
+    return { ok: false, reason: "Estou criando seu ticket… aguarde um instante e tente de novo." };
   }
   STATE.generatingTicket.add(genKey);
 
@@ -875,9 +849,9 @@ async function createTicketChannel({ guild, user }) {
     const menuMsg = await channel.send({
       content:
         `👋 Olá, <@${user.id}>!\n\n` +
-        `✅ **Passo 1:** Envie seu **nick**\n` +
-        `✅ **Passo 2:** Envie seu **email** (ou /setemail)\n` +
-        `✅ **Passo 3:** Clique no pack de **coins** para gerar o link\n\n` +
+        `✅ **Passo 1:** Envie seu **nick** (se ainda não estiver salvo)\n` +
+        `✅ **Passo 2:** Envie seu **email** (para pagamento) ou use /setemail\n` +
+        `✅ **Passo 3:** Clique no pack para gerar o **LINK de pagamento**\n\n` +
         `📌 Nick salvo: **${topicObj.nick || "—"}**\n` +
         `📌 Email salvo: **${topicObj.email || "—"}**`,
       components: buildPackRows(false),
@@ -900,6 +874,18 @@ async function closeTicketChannel(channel, reasonText = "Ticket fechado.") {
   await channel.send(`🔒 ${reasonText}`).catch(() => {});
   cleanupChannelState(channel.id);
   setTimeout(() => channel.delete().catch(() => {}), CONFIG.DELETE_DELAY_MS);
+}
+
+// ===================== LOCK POR TICKET (ANTI-SPAM PACK) =====================
+function acquirePackLock(channelId, byUserId) {
+  const t = now();
+  const cur = STATE.packLocks.get(channelId);
+  if (cur && cur.until > t) return { ok: false, waitMs: cur.until - t, by: cur.by };
+  STATE.packLocks.set(channelId, { until: t + CONFIG.PACK_LOCK_MS, by: byUserId });
+  return { ok: true };
+}
+function releasePackLock(channelId) {
+  STATE.packLocks.delete(channelId);
 }
 
 // ===================== BOTÕES =====================
@@ -937,9 +923,7 @@ async function handleButton(interaction) {
     const isBuyer = buyerId && interaction.user.id === buyerId;
 
     if (customId === "close_ticket") {
-      if (!canCloseTicket(interaction, buyerId)) {
-        return replyEphemeral("⚠️ Você não tem permissão para fechar este ticket.");
-      }
+      if (!canCloseTicket(interaction, buyerId)) return replyEphemeral("⚠️ Você não tem permissão para fechar este ticket.");
       await replyEphemeral("🔒 Fechando em instantes...");
       await closeTicketChannel(channel, "Ticket fechado.");
       return;
@@ -951,7 +935,7 @@ async function handleButton(interaction) {
       const lock = acquirePackLock(channel.id, interaction.user.id);
       if (!lock.ok) {
         const s = Math.ceil(lock.waitMs / 1000);
-        return replyEphemeral(`⏳ Aguarde ${s}s... já estou processando um pedido neste ticket.`);
+        return replyEphemeral(`⏳ Aguarde ${s}s... estou processando um pedido neste ticket.`);
       }
 
       try {
@@ -967,7 +951,7 @@ async function handleButton(interaction) {
         }
 
         const packId = customId.split(":")[1];
-        const pack = COIN_PACKS.find((p) => p.id === packId);
+        const pack = PACKS.find((p) => p.id === packId);
         if (!pack) return replyEphemeral("❌ Pack inválido.");
 
         const nick = String(topicObj.nick || "").trim();
@@ -977,18 +961,10 @@ async function handleButton(interaction) {
         if (!email) return replyEphemeral("❌ Envie seu email (mensagem) ou use /setemail.");
 
         const orderId = makeOrderId(interaction.user.id);
-        const amount = computeFinalPriceBRL(pack.coins, pack.discountPct);
 
         let pref;
         try {
-          pref = await createCheckoutPreference({
-            pack,
-            buyerId: interaction.user.id,
-            nick,
-            email,
-            orderId,
-            amount,
-          });
+          pref = await createCheckoutPreference({ pack, buyerId: interaction.user.id, nick, email, orderId });
         } catch (e) {
           console.log("❌ MP createPreference erro:", e?.response?.data || e?.message || e);
           return replyEphemeral("❌ Não consegui gerar o link de pagamento agora (Mercado Pago).");
@@ -1007,8 +983,7 @@ async function handleButton(interaction) {
           nick,
           email,
           pack_id: pack.id,
-          coins: pack.coins,
-          amount,
+          amount: pack.price,
           status: "PENDING",
           created_at: now(),
           updated_at: now(),
@@ -1019,7 +994,6 @@ async function handleButton(interaction) {
         topicObj.paymentId = "";
         await channel.setTopic(buildTopic(topicObj)).catch(() => {});
 
-        // desabilita botões
         const menuMsgId = String(topicObj.menuMsgId || "").trim();
         if (menuMsgId) {
           try {
@@ -1034,8 +1008,8 @@ async function handleButton(interaction) {
 
         await channel.send(
           `✅ **Link de pagamento gerado!**\n` +
-          `🪙 Coins: **${pack.coins}**\n` +
-          `💰 Valor: **${brl(amount)}**\n` +
+          `🪙 Pack: **${pack.label}**\n` +
+          `💳 Valor: **${brl(pack.price)}**\n` +
           `👤 Nick: **${nick}**\n` +
           `🧾 Pedido: **${orderId}**\n\n` +
           `👉 **Clique para pagar:** ${payLink}\n\n` +
@@ -1049,8 +1023,7 @@ async function handleButton(interaction) {
           nick,
           email,
           packId: pack.id,
-          coins: pack.coins,
-          amount,
+          amount: pack.price,
           orderId,
           paymentId: "—",
           timestamp: now(),
@@ -1072,7 +1045,7 @@ async function handleButton(interaction) {
 // ===================== COMMANDS =====================
 async function handleCommand(interaction) {
   if (isDuplicateInteraction(interaction.id)) {
-    console.log("🟨 DEDUPE cmd:", interaction.id, interaction.commandName);
+    console.log("🟨 DEDUPE cmd interaction:", interaction.id, interaction.commandName);
     return;
   }
 
@@ -1083,7 +1056,7 @@ async function handleCommand(interaction) {
     console.log("[CMD]", interaction.commandName, "by", interaction.user.id, "in", interaction.channelId);
 
     if (interaction.commandName === "setemail") {
-      const email = interaction.options.getString("email", true).trim();
+      const email = interaction.options.getString("email", true).trim().toLowerCase();
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return replyEphemeral("❌ Email inválido.");
 
       const current = stmtGetProfile.get(interaction.user.id) || { nick: "", email: "" };
@@ -1096,6 +1069,7 @@ async function handleCommand(interaction) {
           await interaction.channel.setTopic(buildTopic(topicObj)).catch(() => {});
         }
       }
+
       return replyEphemeral(`✅ Email atualizado para **${email}**.`);
     }
 
@@ -1113,13 +1087,14 @@ async function handleCommand(interaction) {
           await interaction.channel.setTopic(buildTopic(topicObj)).catch(() => {});
         }
       }
+
       return replyEphemeral(`✅ Nick atualizado para **${nick}**.`);
     }
 
     return replyEphemeral("⚠️ Comando desconhecido.");
   } catch (err) {
-    console.error("❌ handleCommand crash FULL:", err);
-    try { return replyEphemeral("❌ Deu erro no comando. Veja os logs do Render."); } catch {}
+    console.error("❌ handleCommand crash:", err);
+    try { return replyEphemeral("❌ Deu erro no comando. Veja os Logs do Render."); } catch {}
   }
 }
 
@@ -1146,7 +1121,6 @@ client.on("messageCreate", async (msg) => {
     if (!nickTopic || nickTopic === "undefined" || nickTopic === "null") {
       const nick = text;
       const current = stmtGetProfile.get(msg.author.id) || { nick: "", email: "" };
-
       stmtUpsertProfile.run({ discord_id: msg.author.id, nick, email: current.email || "", updated_at: now() });
 
       topicObj.nick = nick;
@@ -1162,7 +1136,6 @@ client.on("messageCreate", async (msg) => {
     if (emailIsEmpty && looksEmail) {
       const email = text.toLowerCase();
       const current = stmtGetProfile.get(msg.author.id) || { nick: "", email: "" };
-
       stmtUpsertProfile.run({
         discord_id: msg.author.id,
         nick: current.nick || String(topicObj.nick || "").trim(),
@@ -1172,7 +1145,7 @@ client.on("messageCreate", async (msg) => {
 
       topicObj.email = email;
       await channel.setTopic(buildTopic(topicObj)).catch(() => {});
-      await channel.send(`✅ Email salvo: **${email}**\nAgora clique no pack de coins para gerar o link.`).catch(() => {});
+      await channel.send(`✅ Email salvo: **${email}**\nAgora clique no pack para gerar o link.`).catch(() => {});
       return;
     }
   } catch (e) {
@@ -1198,10 +1171,18 @@ client.on("interactionCreate", async (interaction) => {
 // ===================== READY =====================
 client.once("ready", async () => {
   console.log(`✅ Bot online como: ${client.user.tag}`);
-  console.log(`🔎 MP signature check: ${CONFIG.MP_WEBHOOK_SECRET ? "ON" : "OFF"}`);
-  console.log(`💰 Pricing: feePct=${CONFIG.MP_FEE_PCT} feeFixed=${CONFIG.MP_FEE_FIXED} margin=${CONFIG.MP_MARGIN_PCT} step=${CONFIG.PRICE_STEP}`);
 
-  try { await registerSlashCommands(); } catch (e) { console.log("⚠️ Falha ao registrar slash commands:", e?.message || e); }
+  console.log("🪙 Tabela de packs (coins):");
+  for (const p of PACKS) {
+    console.log(` - ${p.id}: ${p.label} | price=${p.price} | discount=${Math.round(p.discountPct * 1000) / 10}%`);
+  }
+  console.log(`🪙 Base coin: ${COIN_BASE_BRL} | Round step: ${CONFIG.PRICE_ROUND_STEP}`);
+
+  try {
+    await registerSlashCommands();
+  } catch (e) {
+    console.log("⚠️ Falha ao registrar slash commands:", e?.message || e);
+  }
 
   const guild = await client.guilds.fetch(CONFIG.GUILD_ID);
   await rebuildOpenTicketsCache(guild);
@@ -1222,6 +1203,8 @@ function startWebhookServer() {
   app.use(express.json({ limit: "2mb" }));
 
   app.get("/health", (_, res) => res.json({ ok: true }));
+
+  console.log(`🔎 MP signature check: ${CONFIG.MP_WEBHOOK_SECRET ? "ON" : "OFF"}`);
 
   app.post("/mp/webhook", async (req, res) => {
     res.sendStatus(200);
@@ -1257,3 +1240,4 @@ tryAcquireInstanceLockOrExit();
 startInstanceHeartbeat();
 startWebhookServer();
 client.login(CONFIG.DISCORD_TOKEN);
+
