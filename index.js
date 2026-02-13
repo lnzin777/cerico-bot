@@ -1121,6 +1121,7 @@ async function handleCommand(interaction) {
 
   try {
     await ensureDefer();
+console.log("[CMD]", interaction.commandName, "by", interaction.user.id, "in", interaction.channelId);
 
     if (interaction.commandName === "setemail") {
       const email = interaction.options.getString("email", true).trim();
@@ -1171,14 +1172,15 @@ async function handleCommand(interaction) {
     }
 
     return replyEphemeral("⚠️ Comando desconhecido.");
-  } catch (err) {
-    console.error("❌ handleCommand crash:", err);
-    try {
-      return replyEphemeral("❌ Erro interno no comando.");
-    } catch {}
+  } catch (err) {console.error("❌ handleCommand crash FULL:", err);
+try {
+  return await replyEphemeral("❌ Deu erro no comando. Veja os Logs do Render agora.");
+} catch {}
+
   }
 }
 
+// ===================== CAPTURA NICK/EMAIL POR MENSAGEM =====================
 // ===================== CAPTURA NICK/EMAIL POR MENSAGEM =====================
 client.on("messageCreate", async (msg) => {
   try {
@@ -1191,15 +1193,16 @@ client.on("messageCreate", async (msg) => {
     resetInactivityTimer(channel);
 
     const topicObj = parseTopic(channel.topic || "");
-    const buyerId = topicObj.buyer;
+    const buyerId = String(topicObj.buyer || "").trim();
     if (!buyerId) return;
     if (msg.author.id !== buyerId) return;
 
-    const text = (msg.content || "").trim();
+    const text = String(msg.content || "").trim();
     if (!text) return;
 
     // 1) Nick (se não tiver)
-    if (!(topicObj.nick || "").trim()) {
+    const nickTopic = String(topicObj.nick || "").trim();
+    if (!nickTopic || nickTopic === "undefined" || nickTopic === "null") {
       const nick = text;
       const current = stmtGetProfile.get(msg.author.id) || { nick: "", email: "" };
 
@@ -1212,25 +1215,35 @@ client.on("messageCreate", async (msg) => {
 
       topicObj.nick = nick;
       await channel.setTopic(buildTopic(topicObj)).catch(() => {});
-      await channel.send(`✅ Nick salvo: **${nick}**\nAgora envie seu **email** (ou use /setemail).`).catch(() => {});
+      await channel
+        .send(`✅ Nick salvo: **${nick}**\nAgora envie seu **email** (ou use /setemail).`)
+        .catch(() => {});
       return;
     }
 
     // 2) Email (se não tiver e parecer email)
-    if (!(topicObj.email || "").trim() && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text)) {
-      const email = text;
+    const emailTopic = String(topicObj.email || "").trim().toLowerCase();
+    const looksEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text);
+
+    const emailIsEmpty =
+      !emailTopic || emailTopic === "undefined" || emailTopic === "null" || emailTopic === "-" || emailTopic === "0";
+
+    if (emailIsEmpty && looksEmail) {
+      const email = text.toLowerCase();
       const current = stmtGetProfile.get(msg.author.id) || { nick: "", email: "" };
 
       stmtUpsertProfile.run({
         discord_id: msg.author.id,
-        nick: current.nick || topicObj.nick || "",
+        nick: current.nick || String(topicObj.nick || "").trim(),
         email,
         updated_at: now(),
       });
 
       topicObj.email = email;
       await channel.setTopic(buildTopic(topicObj)).catch(() => {});
-      await channel.send(`✅ Email salvo: **${email}**\nAgora clique no pack para gerar o link.`).catch(() => {});
+      await channel
+        .send(`✅ Email salvo: **${email}**\nAgora clique no pack para gerar o link.`)
+        .catch(() => {});
       return;
     }
   } catch (e) {
