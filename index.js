@@ -986,7 +986,7 @@ function releasePackLock(channelId) {
 async function handleButton(interaction) {
   if (isDupInteraction(interaction.id)) return;
 
-  const { ack, done } = createSafeResponder(interaction);
+  const { ack, progress, done } = createSafeResponder(interaction);
   await ack();
 
   try {
@@ -1287,7 +1287,7 @@ client.on("messageCreate", async (msg) => {
 
       topicObj.email = email;
 
-      fireAndForget(withTimeout(channel.setTopic(buildTopic(topicObj)), CONFIG.DISCORD_OP_TIMEOUT_MS, "setTopic(msgEmail)"), "setTopic(msgEmail)");
+     fireAndForget(withTimeout(channel.setTopic(buildTopic(topicObj)), 12000, "setTopic(msgEmail)"), "setTopic(msgEmail)");
       fireAndForget(withTimeout(refreshTicketMenuMessage(channel, topicObj), CONFIG.DISCORD_OP_TIMEOUT_MS, "refreshMenu(msgEmail)"), "refreshMenu(msgEmail)");
 
       await channel.send(`✅ Email salvo: **${email}**\nAgora clique no pack para gerar o link.`).catch(() => {});
