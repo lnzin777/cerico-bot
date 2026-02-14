@@ -1,11 +1,16 @@
 /**
- * index.js — Discord.js v14 + Tickets + SQLite + Mercado Pago (PROD) Checkout Pro + Webhook + Entrega
+ * index.js — Discord.js v14.25.1 + Tickets + SQLite + Mercado Pago (PROD) Checkout Pro + Webhook + Entrega
  * Fixes:
- *  - Nunca "pensando infinito" (ACK único + safe reply)
+ *  - Nunca "pensando infinito" (ACK único + safe responder)
  *  - Anti-duplicação (dedupe interaction + lock por usuário/canal)
  *  - close_ticket (buyer OU suporte OU ManageChannels)
  *  - Anti-spam pack (bloqueia duplo clique + não gera 2 links se tiver PENDING)
  *  - Painel não duplica (usa PANEL_MESSAGE_ID)
+ *  - Captura email por mensagem (nick primeiro; depois email; se já tem email -> /setemail)
+ *
+ * IMPORTANTE (14.25.1):
+ *  - NÃO usar a opção ephemeral (deprecated)
+ *  - Usar flags: MessageFlags.Ephemeral
  */
 
 require("dotenv").config();
@@ -23,7 +28,7 @@ const {
   REST,
   Routes,
   SlashCommandBuilder,
-  MessageFlags, // ✅ usar flags (evita warning do ephemeral deprecated)
+  MessageFlags,
 } = require("discord.js");
 
 const express = require("express");
@@ -67,8 +72,8 @@ const CONFIG = Object.freeze({
 
   // Mercado Pago
   MP_ACCESS_TOKEN: requireEnv("MP_ACCESS_TOKEN"),
-  MP_NOTIFICATION_URL: optionalEnv("MP_NOTIFICATION_URL", ""), // https://cerico-bot.onrender.com/mp/webhook
-  MP_WEBHOOK_SECRET: optionalEnv("MP_WEBHOOK_SECRET", ""), // se não tiver, signature OFF
+  MP_NOTIFICATION_URL: optionalEnv("MP_NOTIFICATION_URL", ""),
+  MP_WEBHOOK_SECRET: optionalEnv("MP_WEBHOOK_SECRET", ""),
 
   // Entrega (sua API)
   API_URL: requireEnv("API_URL"),
@@ -94,10 +99,8 @@ if (CONFIG.SUPPORT_ROLE_ID && !isSnowflake(CONFIG.SUPPORT_ROLE_ID))
 console.log(`🔎 MP signature check: ${CONFIG.MP_WEBHOOK_SECRET ? "ON" : "OFF"}`);
 
 // ===================== COINS / PACKS =====================
-// 1 coin = R$ 1,00
 const COIN_BASE_BRL = 1.0;
 
-// descontos: até 2,5% nos comuns; 5% no 500
 const PACKS = Object.freeze([
   { id: "c5", coins: 5, discount: 0.0, emoji: "🟢" },
   { id: "c10", coins: 10, discount: 0.0, emoji: "🟡" },
@@ -108,7 +111,6 @@ const PACKS = Object.freeze([
 ]);
 
 function roundUpTo50Cents(value) {
-  // arredonda pra cima para 0,50
   return Math.ceil(value * 2) / 2;
 }
 function calcPackPrice(pack) {
@@ -129,7 +131,6 @@ const client = new Client({
 // ===================== SQLITE =====================
 const db = new Database("./loja.sqlite");
 
-// perfil usuário
 db.exec(`
   CREATE TABLE IF NOT EXISTS user_profile (
     discord_id TEXT PRIMARY KEY,
@@ -139,7 +140,6 @@ db.exec(`
   );
 `);
 
-// compras
 db.exec(`
   CREATE TABLE IF NOT EXISTS purchases (
     order_id TEXT PRIMARY KEY,
@@ -152,7 +152,7 @@ db.exec(`
     pack_id TEXT NOT NULL,
     coins INTEGER NOT NULL,
     amount REAL NOT NULL,
-    status TEXT NOT NULL, -- PENDING / APPROVED / DELIVERED / DELIVERY_ERROR / ...
+    status TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
   );
@@ -190,17 +190,18 @@ const stmtFindPendingInChannel = db.prepare(`
 
 // ===================== STATE (RAM) =====================
 const STATE = {
-  openTickets: new Map(), // buyerId -> channelId
-  cooldown: new Map(), // buyerId -> ts
-  inactivityTimers: new Map(), // channelId -> timeout
+  openTickets: new Map(),
+  cooldown: new Map(),
+  inactivityTimers: new Map(),
 
-  handledInteractions: new Map(), // interactionId -> ts
-  creatingTicket: new Set(), // userId
-  packLocks: new Map(), // channelId -> { until, by }
-  delivering: new Set(), // paymentId runtime lock
+  handledInteractions: new Map(),
+  creatingTicket: new Set(),
+  packLocks: new Map(),
+
+  delivering: new Set(),
 };
 
-// ===================== HELPERS: TOPIC =====================
+// ===================== TOPIC HELPERS =====================
 function parseTopic(topic = "") {
   const obj = {};
   topic
@@ -235,21 +236,15 @@ function makeOrderId(userId) {
   return `DISCORD-${userId}-${Date.now()}`;
 }
 
-// ===================== SAFE REPLY (NUNCA trava) =====================
-// Regra obrigatória: deferReply({ flags: Ephemeral }) no começo; depois só editReply.
-// Se interaction morrer (10062), faz fallback mandando msg no canal (pra não ficar travado).
+// ===================== SAFE RESPONDER (SEM "ephemeral") =====================
 function createSafeResponder(interaction) {
   let acked = false;
   let triedAck = false;
 
-  function canChannelFallback() {
-    return interaction?.channel && typeof interaction.channel.send === "function";
-  }
-
+  const canChannelFallback = () => interaction?.channel && typeof interaction.channel.send === "function";
   async function channelFallback(text) {
     try {
       if (!canChannelFallback()) return;
-      // evita spam: manda uma só e menciona o usuário
       await interaction.channel.send(`⚠️ <@${interaction.user.id}> ${text}`).catch(() => {});
     } catch {}
   }
@@ -259,32 +254,30 @@ function createSafeResponder(interaction) {
     triedAck = true;
 
     try {
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral }); // ✅ padrão estável no seu ambiente
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       acked = true;
     } catch (e) {
       const code = e?.code;
       const msg = String(e?.message || "");
 
-      // já foi ack -> ok
       if (code === 40060 || msg.includes("already been acknowledged")) {
         acked = true;
         return;
       }
 
-      // interaction morreu -> não tem como responder via interaction
       if (code === 10062 || msg.includes("Unknown interaction")) {
-        await channelFallback("não consegui responder o comando (interaction expirou). Tente novamente.");
+        await channelFallback("o comando expirou antes de eu responder. Tente novamente.");
         return;
       }
 
       console.log("⚠️ deferReply falhou:", code, msg);
+      await channelFallback("falha ao reconhecer o comando (ACK). Veja logs.");
     }
   }
 
   async function done(content) {
     const text = String(content ?? "");
 
-    // Se já reconheceu, só editReply
     if (interaction.deferred || interaction.replied || acked) {
       try {
         await interaction.editReply({ content: text });
@@ -298,22 +291,16 @@ function createSafeResponder(interaction) {
           return;
         }
 
-        // tenta followUp ephemeral (não vira 2º ack)
         try {
           await interaction.followUp({ content: text, flags: MessageFlags.Ephemeral });
           return;
-        } catch (e2) {
-          const code2 = e2?.code;
-          const msg2 = String(e2?.message || "");
-          if (code2 === 10062 || msg2.includes("Unknown interaction")) {
-            await channelFallback(text);
-          }
+        } catch {
+          await channelFallback(text);
           return;
         }
       }
     }
 
-    // Se ainda não ackou, tenta reply ephemeral
     try {
       await interaction.reply({ content: text, flags: MessageFlags.Ephemeral });
       acked = true;
@@ -334,19 +321,15 @@ function createSafeResponder(interaction) {
         return;
       }
 
-      // último fallback
-      try {
-        await interaction.followUp({ content: text, flags: MessageFlags.Ephemeral });
-      } catch {
-        await channelFallback(text);
-      }
+      console.log("⚠️ reply falhou:", code, msg);
+      await channelFallback(text);
     }
   }
 
   return { ack, done };
 }
 
-// ===================== DEDUPE interaction.id =====================
+// ===================== DEDUPE =====================
 function isDupInteraction(interactionId) {
   const t = now();
   for (const [id, ts] of STATE.handledInteractions.entries()) {
@@ -432,7 +415,7 @@ async function sendPurchaseLog({
   }
 }
 
-// ===================== ENTREGA (SUA API) =====================
+// ===================== ENTREGA =====================
 async function deliverToGame({ nick, packId, coins, orderId }) {
   const url =
     `${CONFIG.API_URL}?token=${encodeURIComponent(CONFIG.API_TOKEN)}` +
@@ -667,7 +650,7 @@ async function processPaymentFromWebhook(paymentId) {
   }
 }
 
-// ===================== UI (PAINEL / MENU TICKET) =====================
+// ===================== UI (PAINEL / MENU) =====================
 function buildPanelMessage() {
   const embed = new EmbedBuilder()
     .setColor(0xf1c40f)
@@ -738,7 +721,7 @@ async function refreshTicketMenuMessage(channel, topicObj) {
   if (!channel || !channel.isTextBased() || !isTicketChannel(channel)) return;
 
   const nick = String(topicObj.nick || "").trim();
-  const email = String(topicObj.email || "").trim();
+  const email = String(topicObj.email || "").trim().toLowerCase();
   const menuMsgId = String(topicObj.menuMsgId || "").trim();
 
   const pending = stmtFindPendingInChannel.get(channel.id);
@@ -817,7 +800,7 @@ async function rebuildOpenTicketsCache(guild) {
   console.log(`🧠 Cache openTickets reconstruído: ${STATE.openTickets.size} tickets.`);
 }
 
-// ===================== PERMISSÃO CLOSE =====================
+// ===================== CLOSE PERM =====================
 function canCloseTicket(interaction, buyerId) {
   if (buyerId && interaction.user.id === buyerId) return true;
 
@@ -950,8 +933,6 @@ async function handleButton(interaction) {
   if (isDupInteraction(interaction.id)) return;
 
   const { ack, done } = createSafeResponder(interaction);
-
-  // ✅ ACK cedo
   await ack();
 
   try {
@@ -1100,16 +1081,14 @@ async function handleCommand(interaction) {
   if (isDupInteraction(interaction.id)) return;
 
   const { ack, done } = createSafeResponder(interaction);
-
   await ack();
+
   console.log("[CMD]", interaction.commandName, "by", interaction.user.id, "in", interaction.channelId);
 
   try {
     if (interaction.commandName === "setemail") {
       const email = String(interaction.options.getString("email", true)).trim().toLowerCase();
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-        return await done("❌ Email inválido.");
-      }
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return await done("❌ Email inválido.");
 
       const current = stmtGetProfile.get(interaction.user.id) || { nick: "", email: "" };
       stmtUpsertProfile.run({
@@ -1164,7 +1143,7 @@ async function handleCommand(interaction) {
   }
 }
 
-// ===================== CAPTURA NICK/EMAIL POR MENSAGEM =====================
+// ===================== MESSAGE CAPTURE (nick/email) =====================
 client.on("messageCreate", async (msg) => {
   try {
     if (!msg.guild) return;
@@ -1192,13 +1171,13 @@ client.on("messageCreate", async (msg) => {
     const emailIsEmpty =
       !emailTopic || ["undefined", "null", "-", "—", "–", "0"].includes(emailTopic);
 
-    // Se mandou email sem nick
+    // regra: email sem nick -> avisar
     if (!nickTopic && looksEmail) {
       await channel.send("❌ Primeiro envie seu **nick**. Depois envie seu **email** (ou use /setemail).").catch(() => {});
       return;
     }
 
-    // 1) salva nick se vazio
+    // salvar nick se não existe
     if (!nickTopic) {
       const nick = text;
 
@@ -1212,7 +1191,6 @@ client.on("messageCreate", async (msg) => {
 
       topicObj.nick = nick;
 
-      // puxa email do perfil se existir
       const refreshed = stmtGetProfile.get(msg.author.id) || { nick, email: "" };
       const profileEmail = String(refreshed.email || "").trim().toLowerCase();
       if (profileEmail && !String(topicObj.email || "").trim()) topicObj.email = profileEmail;
@@ -1230,7 +1208,7 @@ client.on("messageCreate", async (msg) => {
       return;
     }
 
-    // 2) salva email se nick existe e email vazio
+    // salvar email se ainda não existe
     if (looksEmail && emailIsEmpty) {
       const email = text.toLowerCase();
 
@@ -1250,7 +1228,7 @@ client.on("messageCreate", async (msg) => {
       return;
     }
 
-    // 3) se já tem email e mandou outro
+    // se já tem email e mandou outro -> /setemail
     if (looksEmail && !emailIsEmpty) {
       await channel
         .send(`⚠️ Este ticket já tem email salvo: **${emailTopic}**\nSe quiser trocar, use **/setemail**.`)
@@ -1262,7 +1240,7 @@ client.on("messageCreate", async (msg) => {
   }
 });
 
-// ===================== INTERACTIONS =====================
+// ===================== INTERACTIONS (apenas 1 listener) =====================
 client.on("interactionCreate", async (interaction) => {
   try {
     if (interaction.isButton()) return await handleButton(interaction);
