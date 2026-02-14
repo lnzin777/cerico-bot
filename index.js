@@ -1,16 +1,10 @@
 /**
- * index.js — Discord.js v14.25.1 + Tickets + SQLite + Mercado Pago (PROD) Checkout Pro + Webhook + Entrega
- * Fixes:
- *  - Nunca "pensando infinito" (ACK único + safe responder)
- *  - Anti-duplicação (dedupe interaction + lock por usuário/canal)
- *  - close_ticket (buyer OU suporte OU ManageChannels)
- *  - Anti-spam pack (bloqueia duplo clique + não gera 2 links se tiver PENDING)
- *  - Painel não duplica (usa PANEL_MESSAGE_ID)
- *  - Captura email por mensagem (nick primeiro; depois email; se já tem email -> /setemail)
- *
- * IMPORTANTE (14.25.1):
- *  - NÃO usar a opção ephemeral (deprecated)
- *  - Usar flags: MessageFlags.Ephemeral
+ * index.js — Discord.js v14.25.1 + Tickets + SQLite + Mercado Pago + Webhook + Entrega
+ * Correções:
+ *  - SafeResponder com ACK único (deferReply cedo) e SEM "ephemeral"
+ *  - Watchdog: impede "pensando infinito" (se não finalizar, ele finaliza sozinho)
+ *  - messageCreate: captura email mesmo dentro do texto, e aplica regras nick->email
+ *  - Mantém: painel não duplica, ticket não duplica, pack lock, webhook MP, sqlite, etc.
  */
 
 require("dotenv").config();
@@ -65,7 +59,7 @@ const CONFIG = Object.freeze({
   CLIENT_ID: requireEnv("CLIENT_ID"),
   GUILD_ID: requireEnv("GUILD_ID"),
   PANEL_CHANNEL_ID: requireEnv("PANEL_CHANNEL_ID"),
-  PANEL_MESSAGE_ID: optionalEnv("PANEL_MESSAGE_ID", ""), // importante p/ não duplicar
+  PANEL_MESSAGE_ID: optionalEnv("PANEL_MESSAGE_ID", ""),
   TICKET_CATEGORY_ID: requireEnv("TICKET_CATEGORY_ID"),
   LOG_CHANNEL_ID: requireEnv("LOG_CHANNEL_ID"),
   SUPPORT_ROLE_ID: optionalEnv("SUPPORT_ROLE_ID", ""),
@@ -84,12 +78,15 @@ const CONFIG = Object.freeze({
 
   // Timers / Locks
   TICKET_COOLDOWN_MS: Number(optionalEnv("TICKET_COOLDOWN_MS", "60000")),
-  INACTIVITY_CLOSE_MS: Number(optionalEnv("INACTIVITY_CLOSE_MS", String(10 * 60 * 1000))), // 10 min
+  INACTIVITY_CLOSE_MS: Number(optionalEnv("INACTIVITY_CLOSE_MS", String(10 * 60 * 1000))),
   DELETE_DELAY_MS: Number(optionalEnv("DELETE_DELAY_MS", "2500")),
   AUTO_CLOSE_AFTER_DELIVERY_MS: Number(optionalEnv("AUTO_CLOSE_AFTER_DELIVERY_MS", "10000")),
 
   DEDUPE_TTL_MS: Number(optionalEnv("DEDUP_TTL_MS", "15000")),
   PACK_LOCK_MS: Number(optionalEnv("PACK_LOCK_MS", "15000")),
+
+  // watchdog do comando (anti thinking infinito)
+  INTERACTION_WATCHDOG_MS: Number(optionalEnv("INTERACTION_WATCHDOG_MS", "12000")),
 });
 
 if (!isSnowflake(CONFIG.LOG_CHANNEL_ID)) console.warn("⚠️ LOG_CHANNEL_ID inválido (precisa ser snowflake numérico).");
@@ -236,10 +233,30 @@ function makeOrderId(userId) {
   return `DISCORD-${userId}-${Date.now()}`;
 }
 
-// ===================== SAFE RESPONDER (SEM "ephemeral") =====================
+// ===================== EMAIL HELPERS (mais tolerante) =====================
+function extractEmailFromText(text) {
+  const s = String(text || "").trim().toLowerCase();
+  // pega o primeiro email válido dentro do texto
+  const m = s.match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i);
+  return m ? String(m[0]).toLowerCase() : "";
+}
+function isValidEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || ""));
+}
+function normalizeEmail(email) {
+  return String(email || "").trim().toLowerCase();
+}
+function isEmptyEmailValue(v) {
+  const s = String(v ?? "").trim().toLowerCase();
+  return !s || ["undefined", "null", "-", "—", "–", "0"].includes(s);
+}
+
+// ===================== SAFE RESPONDER (ACK único + watchdog) =====================
 function createSafeResponder(interaction) {
   let acked = false;
   let triedAck = false;
+  let finished = false;
+  let watchdog = null;
 
   const canChannelFallback = () => interaction?.channel && typeof interaction.channel.send === "function";
   async function channelFallback(text) {
@@ -249,19 +266,44 @@ function createSafeResponder(interaction) {
     } catch {}
   }
 
+  function startWatchdog() {
+    if (watchdog) return;
+    watchdog = setTimeout(async () => {
+      if (finished) return;
+      finished = true;
+      try {
+        if (interaction.deferred || interaction.replied || acked) {
+          await interaction.editReply({ content: "⚠️ Demorei para responder. Tente novamente agora." }).catch(() => {});
+        } else {
+          await interaction.reply({ content: "⚠️ Demorei para responder. Tente novamente agora.", flags: MessageFlags.Ephemeral }).catch(() => {});
+        }
+      } catch {
+        await channelFallback("demorei para responder. Tente novamente.");
+      }
+    }, CONFIG.INTERACTION_WATCHDOG_MS);
+  }
+
+  function stopWatchdog() {
+    if (watchdog) clearTimeout(watchdog);
+    watchdog = null;
+  }
+
   async function ack() {
     if (interaction.deferred || interaction.replied || acked || triedAck) return;
     triedAck = true;
 
     try {
+      // ACK cedo (regra)
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       acked = true;
+      startWatchdog();
     } catch (e) {
       const code = e?.code;
       const msg = String(e?.message || "");
 
       if (code === 40060 || msg.includes("already been acknowledged")) {
         acked = true;
+        startWatchdog();
         return;
       }
 
@@ -271,11 +313,15 @@ function createSafeResponder(interaction) {
       }
 
       console.log("⚠️ deferReply falhou:", code, msg);
-      await channelFallback("falha ao reconhecer o comando (ACK). Veja logs.");
+      await channelFallback("falha ao reconhecer o comando. Veja os logs.");
     }
   }
 
   async function done(content) {
+    if (finished) return;
+    finished = true;
+    stopWatchdog();
+
     const text = String(content ?? "");
 
     if (interaction.deferred || interaction.replied || acked) {
@@ -285,12 +331,10 @@ function createSafeResponder(interaction) {
       } catch (e) {
         const code = e?.code;
         const msg = String(e?.message || "");
-
         if (code === 10062 || msg.includes("Unknown interaction")) {
           await channelFallback(text);
           return;
         }
-
         try {
           await interaction.followUp({ content: text, flags: MessageFlags.Ephemeral });
           return;
@@ -303,7 +347,6 @@ function createSafeResponder(interaction) {
 
     try {
       await interaction.reply({ content: text, flags: MessageFlags.Ephemeral });
-      acked = true;
       return;
     } catch (e) {
       const code = e?.code;
@@ -650,7 +693,7 @@ async function processPaymentFromWebhook(paymentId) {
   }
 }
 
-// ===================== UI (PAINEL / MENU) =====================
+// ===================== UI =====================
 function buildPanelMessage() {
   const embed = new EmbedBuilder()
     .setColor(0xf1c40f)
@@ -871,7 +914,7 @@ async function createTicketChannel({ guild, user }) {
     const topicObj = {
       buyer: user.id,
       nick: (profile.nick || "").trim(),
-      email: (profile.email || "").trim().toLowerCase(),
+      email: normalizeEmail(profile.email || ""),
       pack: "",
       orderId: "",
       paymentId: "",
@@ -991,10 +1034,11 @@ async function handleButton(interaction) {
         if (!pack) return await done("❌ Pack inválido.");
 
         const nick = String(topicObj.nick || "").trim();
-        const email = String(topicObj.email || "").trim().toLowerCase();
+        const email = normalizeEmail(topicObj.email || "");
 
         if (!nick) return await done("❌ Envie seu nick (mensagem) ou use /setnick.");
         if (!email) return await done("❌ Envie seu email (mensagem) ou use /setemail.");
+        if (!isValidEmail(email)) return await done("❌ Email salvo está inválido. Use /setemail para corrigir.");
 
         const orderId = makeOrderId(interaction.user.id);
 
@@ -1087,8 +1131,10 @@ async function handleCommand(interaction) {
 
   try {
     if (interaction.commandName === "setemail") {
-      const email = String(interaction.options.getString("email", true)).trim().toLowerCase();
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return await done("❌ Email inválido.");
+      const raw = String(interaction.options.getString("email", true));
+      const email = normalizeEmail(raw);
+
+      if (!isValidEmail(email)) return await done("❌ Email inválido.");
 
       const current = stmtGetProfile.get(interaction.user.id) || { nick: "", email: "" };
       stmtUpsertProfile.run({
@@ -1163,21 +1209,20 @@ client.on("messageCreate", async (msg) => {
     const text = String(msg.content || "").trim();
     if (!text) return;
 
-    const looksEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text);
+    const emailFound = extractEmailFromText(text);
+    const looksEmail = !!emailFound && isValidEmail(emailFound);
+
     const nickTopic = String(topicObj.nick || "").trim();
-    const emailTopicRaw = String(topicObj.email ?? "").trim();
-    const emailTopic = emailTopicRaw.toLowerCase();
+    const emailTopic = normalizeEmail(topicObj.email || "");
+    const emailEmpty = isEmptyEmailValue(emailTopic);
 
-    const emailIsEmpty =
-      !emailTopic || ["undefined", "null", "-", "—", "–", "0"].includes(emailTopic);
-
-    // regra: email sem nick -> avisar
+    // email sem nick -> avisar
     if (!nickTopic && looksEmail) {
       await channel.send("❌ Primeiro envie seu **nick**. Depois envie seu **email** (ou use /setemail).").catch(() => {});
       return;
     }
 
-    // salvar nick se não existe
+    // salvar nick se não existe (e não é email)
     if (!nickTopic) {
       const nick = text;
 
@@ -1192,8 +1237,8 @@ client.on("messageCreate", async (msg) => {
       topicObj.nick = nick;
 
       const refreshed = stmtGetProfile.get(msg.author.id) || { nick, email: "" };
-      const profileEmail = String(refreshed.email || "").trim().toLowerCase();
-      if (profileEmail && !String(topicObj.email || "").trim()) topicObj.email = profileEmail;
+      const profileEmail = normalizeEmail(refreshed.email || "");
+      if (profileEmail && emailEmpty) topicObj.email = profileEmail;
 
       await channel.setTopic(buildTopic(topicObj)).catch(() => {});
       await refreshTicketMenuMessage(channel, topicObj);
@@ -1208,14 +1253,13 @@ client.on("messageCreate", async (msg) => {
       return;
     }
 
-    // salvar email se ainda não existe
-    if (looksEmail && emailIsEmpty) {
-      const email = text.toLowerCase();
+    // salvar email se nick existe e email ainda não existe
+    if (looksEmail && emailEmpty) {
+      const email = normalizeEmail(emailFound);
 
-      const current = stmtGetProfile.get(msg.author.id) || { nick: nickTopic, email: "" };
       stmtUpsertProfile.run({
         discord_id: msg.author.id,
-        nick: current.nick || nickTopic,
+        nick: (stmtGetProfile.get(msg.author.id)?.nick || nickTopic || "").trim(),
         email,
         updated_at: now(),
       });
@@ -1228,8 +1272,8 @@ client.on("messageCreate", async (msg) => {
       return;
     }
 
-    // se já tem email e mandou outro -> /setemail
-    if (looksEmail && !emailIsEmpty) {
+    // se já tem email e mandar outro -> instruir /setemail
+    if (looksEmail && !emailEmpty) {
       await channel
         .send(`⚠️ Este ticket já tem email salvo: **${emailTopic}**\nSe quiser trocar, use **/setemail**.`)
         .catch(() => {});
