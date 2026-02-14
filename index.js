@@ -1184,7 +1184,13 @@ client.on("messageCreate", async (msg) => {
 
     const looksEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text);
     const nickTopic = String(topicObj.nick || "").trim();
-    const emailTopic = String(topicObj.email || "").trim().toLowerCase();
+   const emailTopicRaw = String(topicObj.email ?? "").trim();
+const emailTopic = emailTopicRaw.toLowerCase();
+
+const emailIsEmpty =
+  !emailTopic ||
+  ["undefined", "null", "-", "—", "–", "0"].includes(emailTopic);
+
 
     // 0) Se usuário mandou EMAIL mas ainda não tem NICK -> não salva como nick
     if (!nickTopic && looksEmail) {
@@ -1224,8 +1230,7 @@ client.on("messageCreate", async (msg) => {
     }
 
     // 2) Salvar EMAIL se ainda não existe
-    const emailIsEmpty =
-      !emailTopic || emailTopic === "undefined" || emailTopic === "null" || emailTopic === "-" || emailTopic === "0";
+   
 
     if (looksEmail && emailIsEmpty) {
       const email = text.toLowerCase();
