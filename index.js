@@ -23,6 +23,7 @@ const {
   REST,
   Routes,
   SlashCommandBuilder,
+  MessageFlags, // ✅ usar flags (evita warning do ephemeral deprecated)
 } = require("discord.js");
 
 const express = require("express");
@@ -191,14 +192,11 @@ const stmtFindPendingInChannel = db.prepare(`
 const STATE = {
   openTickets: new Map(), // buyerId -> channelId
   cooldown: new Map(), // buyerId -> ts
-
   inactivityTimers: new Map(), // channelId -> timeout
 
-  // anti-duplicação
   handledInteractions: new Map(), // interactionId -> ts
   creatingTicket: new Set(), // userId
   packLocks: new Map(), // channelId -> { until, by }
-
   delivering: new Set(), // paymentId runtime lock
 };
 
@@ -238,84 +236,110 @@ function makeOrderId(userId) {
 }
 
 // ===================== SAFE REPLY (NUNCA trava) =====================
-// Regras obrigatórias:
-//  - Sempre deferReply({ ephemeral: true }) NO COMEÇO (até 2s)
-//  - Depois apenas editReply()
-//  - Se já foi ack, nunca tentar reply() de novo
+// Regra obrigatória: deferReply({ flags: Ephemeral }) no começo; depois só editReply.
+// Se interaction morrer (10062), faz fallback mandando msg no canal (pra não ficar travado).
 function createSafeResponder(interaction) {
-  let didAck = false;
-  let ackTried = false;
+  let acked = false;
+  let triedAck = false;
 
-  const isAcked = () => interaction.deferred || interaction.replied || didAck;
+  function canChannelFallback() {
+    return interaction?.channel && typeof interaction.channel.send === "function";
+  }
+
+  async function channelFallback(text) {
+    try {
+      if (!canChannelFallback()) return;
+      // evita spam: manda uma só e menciona o usuário
+      await interaction.channel.send(`⚠️ <@${interaction.user.id}> ${text}`).catch(() => {});
+    } catch {}
+  }
 
   async function ack() {
-    if (isAcked() || ackTried) return;
-    ackTried = true;
+    if (interaction.deferred || interaction.replied || acked || triedAck) return;
+    triedAck = true;
 
     try {
-      await interaction.deferReply({ ephemeral: true }); // ✅ mais estável que flags
-      didAck = true;
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral }); // ✅ padrão estável no seu ambiente
+      acked = true;
     } catch (e) {
-      // Se já foi ack em outro lugar, ok (não quebra)
-      if (e?.code === 40060 || String(e?.message || "").includes("already been acknowledged")) {
-        didAck = true;
+      const code = e?.code;
+      const msg = String(e?.message || "");
+
+      // já foi ack -> ok
+      if (code === 40060 || msg.includes("already been acknowledged")) {
+        acked = true;
         return;
       }
-      // Se for unknown interaction, não tem como responder mesmo (evita crash)
-      if (e?.code === 10062 || String(e?.message || "").includes("Unknown interaction")) {
+
+      // interaction morreu -> não tem como responder via interaction
+      if (code === 10062 || msg.includes("Unknown interaction")) {
+        await channelFallback("não consegui responder o comando (interaction expirou). Tente novamente.");
         return;
       }
-      console.log("⚠️ deferReply falhou:", e?.code, e?.message || e);
+
+      console.log("⚠️ deferReply falhou:", code, msg);
     }
   }
 
   async function done(content) {
     const text = String(content ?? "");
 
-    // ✅ padrão: após ACK -> editReply
-    if (interaction.deferred || interaction.replied) {
+    // Se já reconheceu, só editReply
+    if (interaction.deferred || interaction.replied || acked) {
       try {
         await interaction.editReply({ content: text });
         return;
       } catch (e) {
-        // se editReply falhar, tenta followUp ephemeral
-        try {
-          await interaction.followUp({ content: text, ephemeral: true });
+        const code = e?.code;
+        const msg = String(e?.message || "");
+
+        if (code === 10062 || msg.includes("Unknown interaction")) {
+          await channelFallback(text);
           return;
-        } catch {
+        }
+
+        // tenta followUp ephemeral (não vira 2º ack)
+        try {
+          await interaction.followUp({ content: text, flags: MessageFlags.Ephemeral });
+          return;
+        } catch (e2) {
+          const code2 = e2?.code;
+          const msg2 = String(e2?.message || "");
+          if (code2 === 10062 || msg2.includes("Unknown interaction")) {
+            await channelFallback(text);
+          }
           return;
         }
       }
     }
 
-    // Se ainda não foi ack, tenta reply (ephemeral) o quanto antes.
+    // Se ainda não ackou, tenta reply ephemeral
     try {
-      await interaction.reply({ content: text, ephemeral: true });
-      didAck = true;
+      await interaction.reply({ content: text, flags: MessageFlags.Ephemeral });
+      acked = true;
       return;
     } catch (e) {
-      // Se já foi ack (40060), NÃO tente reply de novo. Tenta editReply / followUp.
-      if (e?.code === 40060 || String(e?.message || "").includes("already been acknowledged")) {
+      const code = e?.code;
+      const msg = String(e?.message || "");
+
+      if (code === 40060 || msg.includes("already been acknowledged")) {
         try {
           await interaction.editReply({ content: text });
           return;
         } catch {}
-        try {
-          await interaction.followUp({ content: text, ephemeral: true });
-          return;
-        } catch {}
+      }
+
+      if (code === 10062 || msg.includes("Unknown interaction")) {
+        await channelFallback(text);
         return;
       }
 
-      // Unknown interaction: não dá pra responder via interaction
-      if (e?.code === 10062 || String(e?.message || "").includes("Unknown interaction")) {
-        return;
-      }
-
-      console.log("⚠️ reply falhou:", e?.code, e?.message || e);
+      // último fallback
       try {
-        await interaction.followUp({ content: text, ephemeral: true });
-      } catch {}
+        await interaction.followUp({ content: text, flags: MessageFlags.Ephemeral });
+      } catch {
+        await channelFallback(text);
+      }
     }
   }
 
@@ -471,7 +495,6 @@ async function getPayment(paymentId) {
   return res.data;
 }
 
-// signature verify (se não tem secret, OFF)
 function verifyMpSignature({ xSignature, xRequestId, dataId }) {
   if (!CONFIG.MP_WEBHOOK_SECRET) return true;
 
@@ -728,9 +751,7 @@ async function refreshTicketMenuMessage(channel, topicObj) {
       embeds: [buildTicketMenuEmbed({ nick, email })],
       components: buildPackRows(disablePacks),
     });
-  } catch {
-    // se não achar a msg, não quebra o fluxo
-  }
+  } catch {}
 }
 
 async function sendOrEditPanel() {
@@ -930,7 +951,7 @@ async function handleButton(interaction) {
 
   const { ack, done } = createSafeResponder(interaction);
 
-  // ✅ ACK cedo, antes de qualquer lógica pesada
+  // ✅ ACK cedo
   await ack();
 
   try {
@@ -1031,7 +1052,6 @@ async function handleButton(interaction) {
         topicObj.paymentId = "";
         await channel.setTopic(buildTopic(topicObj)).catch(() => {});
 
-        // ✅ atualiza menu e trava packs (pendente)
         await refreshTicketMenuMessage(channel, topicObj);
 
         await channel
@@ -1060,7 +1080,7 @@ async function handleButton(interaction) {
           timestamp: now(),
         });
 
-        return; // resposta já foi pelo done()
+        return;
       } finally {
         releasePackLock(channel.id);
       }
@@ -1075,18 +1095,16 @@ async function handleButton(interaction) {
   }
 }
 
-// ===================== COMMAND HANDLER (FIX thinking infinito) =====================
+// ===================== COMMAND HANDLER =====================
 async function handleCommand(interaction) {
   if (isDupInteraction(interaction.id)) return;
 
   const { ack, done } = createSafeResponder(interaction);
 
-  // ✅ ACK cedo
   await ack();
+  console.log("[CMD]", interaction.commandName, "by", interaction.user.id, "in", interaction.channelId);
 
   try {
-    console.log("[CMD]", interaction.commandName, "by", interaction.user.id, "in", interaction.channelId);
-
     if (interaction.commandName === "setemail") {
       const email = String(interaction.options.getString("email", true)).trim().toLowerCase();
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
@@ -1101,7 +1119,6 @@ async function handleCommand(interaction) {
         updated_at: now(),
       });
 
-      // se estiver no ticket do buyer, atualiza topic e menu
       if (interaction.channel && isTicketChannel(interaction.channel)) {
         const topicObj = parseTopic(interaction.channel.topic || "");
         if (String(topicObj.buyer || "") === interaction.user.id) {
@@ -1175,13 +1192,13 @@ client.on("messageCreate", async (msg) => {
     const emailIsEmpty =
       !emailTopic || ["undefined", "null", "-", "—", "–", "0"].includes(emailTopic);
 
-    // Regra: se mandou email sem nick -> avisa "primeiro nick"
+    // Se mandou email sem nick
     if (!nickTopic && looksEmail) {
       await channel.send("❌ Primeiro envie seu **nick**. Depois envie seu **email** (ou use /setemail).").catch(() => {});
       return;
     }
 
-    // 1) Salvar NICK se ainda não existe
+    // 1) salva nick se vazio
     if (!nickTopic) {
       const nick = text;
 
@@ -1213,7 +1230,7 @@ client.on("messageCreate", async (msg) => {
       return;
     }
 
-    // 2) Salvar EMAIL se ainda não existe (nick já existe)
+    // 2) salva email se nick existe e email vazio
     if (looksEmail && emailIsEmpty) {
       const email = text.toLowerCase();
 
@@ -1233,15 +1250,13 @@ client.on("messageCreate", async (msg) => {
       return;
     }
 
-    // 3) Se mandou outro email e já existe email -> instruir usar /setemail
+    // 3) se já tem email e mandou outro
     if (looksEmail && !emailIsEmpty) {
       await channel
         .send(`⚠️ Este ticket já tem email salvo: **${emailTopic}**\nSe quiser trocar, use **/setemail**.`)
         .catch(() => {});
       return;
     }
-
-    // Se não parece email e já tem nick, não faz nada (evita salvar lixo como email)
   } catch (e) {
     console.log("⚠️ messageCreate error:", e?.message || e);
   }
