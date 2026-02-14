@@ -89,7 +89,7 @@ const CONFIG = Object.freeze({
   INTERACTION_WATCHDOG_MS: Number(optionalEnv("INTERACTION_WATCHDOG_MS", "12000")),
 
   // Timeouts de Discord API (pra não pendurar)
-  DISCORD_OP_TIMEOUT_MS: Number(optionalEnv("DISCORD_OP_TIMEOUT_MS", "5000")),
+  DISCORD_OP_TIMEOUT_MS: Number(optionalEnv("DISCORD_OP_TIMEOUT_MS", "15000")),
 });
 
 if (!isSnowflake(CONFIG.LOG_CHANNEL_ID)) console.warn("⚠️ LOG_CHANNEL_ID inválido.");
@@ -764,17 +764,27 @@ function buildPackRows(disabled = false) {
 async function refreshTicketMenuMessage(channel, topicObj) {
   if (!channel || !channel.isTextBased() || !isTicketChannel(channel)) return;
 
-  const nick = String(topicObj.nick || "").trim();
-  const email = String(topicObj.email || "").trim().toLowerCase();
+  // ✅ Fonte de verdade: DB (pra não depender do topic)
+  const buyerId = String(topicObj.buyer || "").trim();
+  const prof = buyerId ? (stmtGetProfile.get(buyerId) || { nick: "", email: "" }) : { nick: "", email: "" };
+
+  // Preferência: topic (se tiver) senão DB
+  const nick = String(topicObj.nick || prof.nick || "").trim();
+  const email = String(topicObj.email || prof.email || "").trim().toLowerCase();
+
   const menuMsgId = String(topicObj.menuMsgId || "").trim();
+  if (!menuMsgId) return;
 
   const pending = stmtFindPendingInChannel.get(channel.id);
   const disablePacks = !!pending;
 
-  if (!menuMsgId) return;
-
   try {
-    const menuMsg = await withTimeout(channel.messages.fetch(menuMsgId), CONFIG.DISCORD_OP_TIMEOUT_MS, "fetch(menuMsg)");
+    const menuMsg = await withTimeout(
+      channel.messages.fetch(menuMsgId),
+      CONFIG.DISCORD_OP_TIMEOUT_MS,
+      "fetch(menuMsg)"
+    );
+
     await withTimeout(
       menuMsg.edit({
         embeds: [buildTicketMenuEmbed({ nick, email })],
@@ -787,6 +797,7 @@ async function refreshTicketMenuMessage(channel, topicObj) {
     console.log("⚠️ refreshTicketMenuMessage falhou:", e?.message || e);
   }
 }
+
 
 async function sendOrEditPanel() {
   const guild = await client.guilds.fetch(CONFIG.GUILD_ID);
@@ -1043,12 +1054,28 @@ async function handleButton(interaction) {
         const pack = PACKS.find((p) => p.id === packId);
         if (!pack) return await done("❌ Pack inválido.");
 
-        const nick = String(topicObj.nick || "").trim();
-        const email = normalizeEmail(topicObj.email || "");
+      // ✅ Fonte de verdade: DB (não depende do topic)
+const prof = stmtGetProfile.get(interaction.user.id) || { nick: "", email: "" };
 
-        if (!nick) return await done("❌ Envie seu nick (mensagem) ou use /setnick.");
-        if (!email) return await done("❌ Envie seu email (mensagem) ou use /setemail.");
-        if (!isValidEmail(email)) return await done("❌ Email salvo inválido. Use /setemail para corrigir.");
+// Preferência: topic (se tiver) senão DB
+const nick = String(topicObj.nick || prof.nick || "").trim();
+const email = normalizeEmail(topicObj.email || prof.email || "");
+
+// validações
+if (!nick) return await done("❌ Envie seu nick (mensagem) ou use /setnick.");
+if (!email) return await done("❌ Envie seu email (mensagem) ou use /setemail.");
+if (!isValidEmail(email)) return await done("❌ Email inválido. Use /setemail para corrigir.");
+
+// (opcional, mas ajuda) tenta “reparar” o topic em background sem travar
+if (nick && String(topicObj.nick || "").trim() !== nick) {
+  topicObj.nick = nick;
+  fireAndForget(withTimeout(channel.setTopic(buildTopic(topicObj)), 15000, "setTopic(repairNick)"), "setTopic(repairNick)");
+}
+if (email && normalizeEmail(topicObj.email || "") !== email) {
+  topicObj.email = email;
+  fireAndForget(withTimeout(channel.setTopic(buildTopic(topicObj)), 15000, "setTopic(repairEmail)"), "setTopic(repairEmail)");
+}
+
 
         const orderId = makeOrderId(interaction.user.id);
 
