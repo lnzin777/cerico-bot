@@ -1,10 +1,10 @@
 /**
  * index.js — Discord.js v14.25.1 + Tickets + SQLite + Mercado Pago + Webhook + Entrega
- * Correções:
- *  - SafeResponder com ACK único (deferReply cedo) e SEM "ephemeral"
- *  - Watchdog: impede "pensando infinito" (se não finalizar, ele finaliza sozinho)
- *  - messageCreate: captura email mesmo dentro do texto, e aplica regras nick->email
- *  - Mantém: painel não duplica, ticket não duplica, pack lock, webhook MP, sqlite, etc.
+ * Objetivo:
+ *  - ACABAR com "pensando infinito" / "app não respondeu"
+ *  - /setnick e /setemail respondem IMEDIATO (não travam em setTopic/edit)
+ *  - Email por mensagem funciona (nick primeiro, depois email)
+ *  - Mantém: painel dedupe, ticket dedupe, pack lock, webhook MP /mp/webhook, SQLite
  */
 
 require("dotenv").config();
@@ -66,7 +66,7 @@ const CONFIG = Object.freeze({
 
   // Mercado Pago
   MP_ACCESS_TOKEN: requireEnv("MP_ACCESS_TOKEN"),
-  MP_NOTIFICATION_URL: optionalEnv("MP_NOTIFICATION_URL", ""),
+  MP_NOTIFICATION_URL: optionalEnv("MP_NOTIFICATION_URL", ""), // https://.../mp/webhook
   MP_WEBHOOK_SECRET: optionalEnv("MP_WEBHOOK_SECRET", ""),
 
   // Entrega (sua API)
@@ -78,20 +78,22 @@ const CONFIG = Object.freeze({
 
   // Timers / Locks
   TICKET_COOLDOWN_MS: Number(optionalEnv("TICKET_COOLDOWN_MS", "60000")),
-  INACTIVITY_CLOSE_MS: Number(optionalEnv("INACTIVITY_CLOSE_MS", String(10 * 60 * 1000))),
+  INACTIVITY_CLOSE_MS: Number(optionalEnv("INACTIVITY_CLOSE_MS", String(10 * 60 * 1000))), // 10 min
   DELETE_DELAY_MS: Number(optionalEnv("DELETE_DELAY_MS", "2500")),
   AUTO_CLOSE_AFTER_DELIVERY_MS: Number(optionalEnv("AUTO_CLOSE_AFTER_DELIVERY_MS", "10000")),
 
   DEDUPE_TTL_MS: Number(optionalEnv("DEDUP_TTL_MS", "15000")),
   PACK_LOCK_MS: Number(optionalEnv("PACK_LOCK_MS", "15000")),
 
-  // watchdog do comando (anti thinking infinito)
+  // Anti-trava interaction
   INTERACTION_WATCHDOG_MS: Number(optionalEnv("INTERACTION_WATCHDOG_MS", "12000")),
+
+  // Timeouts de Discord API (pra não pendurar)
+  DISCORD_OP_TIMEOUT_MS: Number(optionalEnv("DISCORD_OP_TIMEOUT_MS", "5000")),
 });
 
-if (!isSnowflake(CONFIG.LOG_CHANNEL_ID)) console.warn("⚠️ LOG_CHANNEL_ID inválido (precisa ser snowflake numérico).");
-if (CONFIG.SUPPORT_ROLE_ID && !isSnowflake(CONFIG.SUPPORT_ROLE_ID))
-  console.warn("⚠️ SUPPORT_ROLE_ID inválido (precisa ser snowflake numérico).");
+if (!isSnowflake(CONFIG.LOG_CHANNEL_ID)) console.warn("⚠️ LOG_CHANNEL_ID inválido.");
+if (CONFIG.SUPPORT_ROLE_ID && !isSnowflake(CONFIG.SUPPORT_ROLE_ID)) console.warn("⚠️ SUPPORT_ROLE_ID inválido.");
 
 console.log(`🔎 MP signature check: ${CONFIG.MP_WEBHOOK_SECRET ? "ON" : "OFF"}`);
 
@@ -128,6 +130,7 @@ const client = new Client({
 // ===================== SQLITE =====================
 const db = new Database("./loja.sqlite");
 
+// perfil
 db.exec(`
   CREATE TABLE IF NOT EXISTS user_profile (
     discord_id TEXT PRIMARY KEY,
@@ -137,6 +140,7 @@ db.exec(`
   );
 `);
 
+// compras
 db.exec(`
   CREATE TABLE IF NOT EXISTS purchases (
     order_id TEXT PRIMARY KEY,
@@ -171,6 +175,7 @@ const stmtInsertPurchase = db.prepare(`
   INSERT INTO purchases (order_id, payment_id, preference_id, buyer_id, channel_id, nick, email, pack_id, coins, amount, status, created_at, updated_at)
   VALUES (@order_id, @payment_id, @preference_id, @buyer_id, @channel_id, @nick, @email, @pack_id, @coins, @amount, @status, @created_at, @updated_at)
 `);
+
 const stmtGetPurchaseByOrder = db.prepare(`SELECT * FROM purchases WHERE order_id = ?`);
 const stmtGetPurchaseByPayment = db.prepare(`SELECT * FROM purchases WHERE payment_id = ?`);
 const stmtUpdatePurchase = db.prepare(`
@@ -187,16 +192,28 @@ const stmtFindPendingInChannel = db.prepare(`
 
 // ===================== STATE (RAM) =====================
 const STATE = {
-  openTickets: new Map(),
-  cooldown: new Map(),
-  inactivityTimers: new Map(),
+  openTickets: new Map(),        // buyerId -> channelId
+  cooldown: new Map(),           // buyerId -> ts
+  inactivityTimers: new Map(),   // channelId -> timeout
 
-  handledInteractions: new Map(),
-  creatingTicket: new Set(),
-  packLocks: new Map(),
+  handledInteractions: new Map(),// interactionId -> ts
+  creatingTicket: new Set(),     // userId
+  packLocks: new Map(),          // channelId -> {until, by}
 
-  delivering: new Set(),
+  delivering: new Set(),         // paymentId lock
 };
+
+// ===================== PROMISE HELPERS =====================
+function withTimeout(promise, ms, label = "op") {
+  let to;
+  const timeout = new Promise((_, rej) => {
+    to = setTimeout(() => rej(new Error(`TIMEOUT ${label} (${ms}ms)`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(to));
+}
+function fireAndForget(p, label) {
+  Promise.resolve(p).catch((e) => console.log("⚠️ bg failed:", label, e?.message || e));
+}
 
 // ===================== TOPIC HELPERS =====================
 function parseTopic(topic = "") {
@@ -233,15 +250,14 @@ function makeOrderId(userId) {
   return `DISCORD-${userId}-${Date.now()}`;
 }
 
-// ===================== EMAIL HELPERS (mais tolerante) =====================
+// ===================== EMAIL HELPERS =====================
 function extractEmailFromText(text) {
-  const s = String(text || "").trim().toLowerCase();
-  // pega o primeiro email válido dentro do texto
+  const s = String(text || "").trim();
   const m = s.match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i);
-  return m ? String(m[0]).toLowerCase() : "";
+  return m ? String(m[0]).trim().toLowerCase() : "";
 }
 function isValidEmail(email) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || ""));
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || "").trim());
 }
 function normalizeEmail(email) {
   return String(email || "").trim().toLowerCase();
@@ -251,7 +267,7 @@ function isEmptyEmailValue(v) {
   return !s || ["undefined", "null", "-", "—", "–", "0"].includes(s);
 }
 
-// ===================== SAFE RESPONDER (ACK único + watchdog) =====================
+// ===================== SAFE RESPONDER (anti looping) =====================
 function createSafeResponder(interaction) {
   let acked = false;
   let triedAck = false;
@@ -271,14 +287,17 @@ function createSafeResponder(interaction) {
     watchdog = setTimeout(async () => {
       if (finished) return;
       finished = true;
+
       try {
         if (interaction.deferred || interaction.replied || acked) {
           await interaction.editReply({ content: "⚠️ Demorei para responder. Tente novamente agora." }).catch(() => {});
         } else {
-          await interaction.reply({ content: "⚠️ Demorei para responder. Tente novamente agora.", flags: MessageFlags.Ephemeral }).catch(() => {});
+          await interaction
+            .reply({ content: "⚠️ Demorei para responder. Tente novamente agora.", flags: MessageFlags.Ephemeral })
+            .catch(() => {});
         }
       } catch {
-        await channelFallback("demorei para responder. Tente novamente.");
+        await channelFallback("Demorei para responder. Tente novamente.");
       }
     }, CONFIG.INTERACTION_WATCHDOG_MS);
   }
@@ -293,8 +312,7 @@ function createSafeResponder(interaction) {
     triedAck = true;
 
     try {
-      // ACK cedo (regra)
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral }); // ACK cedo
       acked = true;
       startWatchdog();
     } catch (e) {
@@ -306,7 +324,6 @@ function createSafeResponder(interaction) {
         startWatchdog();
         return;
       }
-
       if (code === 10062 || msg.includes("Unknown interaction")) {
         await channelFallback("o comando expirou antes de eu responder. Tente novamente.");
         return;
@@ -331,10 +348,12 @@ function createSafeResponder(interaction) {
       } catch (e) {
         const code = e?.code;
         const msg = String(e?.message || "");
+
         if (code === 10062 || msg.includes("Unknown interaction")) {
           await channelFallback(text);
           return;
         }
+
         try {
           await interaction.followUp({ content: text, flags: MessageFlags.Ephemeral });
           return;
@@ -358,7 +377,6 @@ function createSafeResponder(interaction) {
           return;
         } catch {}
       }
-
       if (code === 10062 || msg.includes("Unknown interaction")) {
         await channelFallback(text);
         return;
@@ -372,7 +390,7 @@ function createSafeResponder(interaction) {
   return { ack, done };
 }
 
-// ===================== DEDUPE =====================
+// ===================== DEDUPE interaction.id =====================
 function isDupInteraction(interactionId) {
   const t = now();
   for (const [id, ts] of STATE.handledInteractions.entries()) {
@@ -458,7 +476,7 @@ async function sendPurchaseLog({
   }
 }
 
-// ===================== ENTREGA =====================
+// ===================== ENTREGA (SUA API) =====================
 async function deliverToGame({ nick, packId, coins, orderId }) {
   const url =
     `${CONFIG.API_URL}?token=${encodeURIComponent(CONFIG.API_TOKEN)}` +
@@ -569,7 +587,6 @@ async function processPaymentFromWebhook(paymentId) {
     const orderId = String(payment?.external_reference || "");
 
     console.log("[MP] payment", pid, "status", status, "orderId", orderId);
-
     if (!orderId) return;
 
     const purchase = stmtGetPurchaseByOrder.get(orderId);
@@ -610,10 +627,7 @@ async function processPaymentFromWebhook(paymentId) {
     if (channel?.isTextBased()) {
       await channel
         .send(
-          `✅ **Pagamento aprovado!**\n` +
-            `🧾 Pedido: **${orderId}**\n` +
-            `🧾 PaymentId: **${pid}**\n` +
-            `⚡ Iniciando entrega automática...`
+          `✅ **Pagamento aprovado!**\n🧾 Pedido: **${orderId}**\n🧾 PaymentId: **${pid}**\n⚡ Iniciando entrega automática...`
         )
         .catch(() => {});
     }
@@ -693,7 +707,7 @@ async function processPaymentFromWebhook(paymentId) {
   }
 }
 
-// ===================== UI =====================
+// ===================== UI (PAINEL / MENU) =====================
 function buildPanelMessage() {
   const embed = new EmbedBuilder()
     .setColor(0xf1c40f)
@@ -771,13 +785,20 @@ async function refreshTicketMenuMessage(channel, topicObj) {
   const disablePacks = !!pending;
 
   if (!menuMsgId) return;
+
   try {
-    const menuMsg = await channel.messages.fetch(menuMsgId);
-    await menuMsg.edit({
-      embeds: [buildTicketMenuEmbed({ nick, email })],
-      components: buildPackRows(disablePacks),
-    });
-  } catch {}
+    const menuMsg = await withTimeout(channel.messages.fetch(menuMsgId), CONFIG.DISCORD_OP_TIMEOUT_MS, "fetch(menuMsg)");
+    await withTimeout(
+      menuMsg.edit({
+        embeds: [buildTicketMenuEmbed({ nick, email })],
+        components: buildPackRows(disablePacks),
+      }),
+      CONFIG.DISCORD_OP_TIMEOUT_MS,
+      "edit(menuMsg)"
+    );
+  } catch (e) {
+    console.log("⚠️ refreshTicketMenuMessage falhou:", e?.message || e);
+  }
 }
 
 async function sendOrEditPanel() {
@@ -864,12 +885,14 @@ function canCloseTicket(interaction, buyerId) {
 async function createTicketChannel({ guild, user }) {
   const ts = now();
 
+  // cooldown
   const last = STATE.cooldown.get(user.id) || 0;
   if (ts - last < CONFIG.TICKET_COOLDOWN_MS) {
     const wait = Math.ceil((CONFIG.TICKET_COOLDOWN_MS - (ts - last)) / 1000);
     return { ok: false, reason: `Aguarde ${wait}s para abrir outro ticket.` };
   }
 
+  // já aberto?
   const cached = STATE.openTickets.get(user.id);
   if (cached) {
     const existing = await guild.channels.fetch(cached).catch(() => null);
@@ -879,6 +902,7 @@ async function createTicketChannel({ guild, user }) {
     STATE.openTickets.delete(user.id);
   }
 
+  // lock por user
   if (STATE.creatingTicket.has(user.id)) {
     return { ok: false, reason: "Estou criando seu ticket… aguarde um instante." };
   }
@@ -1038,7 +1062,7 @@ async function handleButton(interaction) {
 
         if (!nick) return await done("❌ Envie seu nick (mensagem) ou use /setnick.");
         if (!email) return await done("❌ Envie seu email (mensagem) ou use /setemail.");
-        if (!isValidEmail(email)) return await done("❌ Email salvo está inválido. Use /setemail para corrigir.");
+        if (!isValidEmail(email)) return await done("❌ Email salvo inválido. Use /setemail para corrigir.");
 
         const orderId = makeOrderId(interaction.user.id);
 
@@ -1072,12 +1096,12 @@ async function handleButton(interaction) {
           updated_at: now(),
         });
 
+        // Atualiza topic/menu sem travar (timeout)
         topicObj.pack = pack.id;
         topicObj.orderId = orderId;
         topicObj.paymentId = "";
-        await channel.setTopic(buildTopic(topicObj)).catch(() => {});
-
-        await refreshTicketMenuMessage(channel, topicObj);
+        fireAndForget(withTimeout(channel.setTopic(buildTopic(topicObj)), CONFIG.DISCORD_OP_TIMEOUT_MS, "setTopic(pack)"), "setTopic(pack)");
+        fireAndForget(withTimeout(refreshTicketMenuMessage(channel, topicObj), CONFIG.DISCORD_OP_TIMEOUT_MS, "refreshMenu(pack)"), "refreshMenu(pack)");
 
         await channel
           .send(
@@ -1120,7 +1144,7 @@ async function handleButton(interaction) {
   }
 }
 
-// ===================== COMMAND HANDLER =====================
+// ===================== COMMAND HANDLER (RESPONDE ANTES DE ATUALIZAR MENU/TOPIC) =====================
 async function handleCommand(interaction) {
   if (isDupInteraction(interaction.id)) return;
 
@@ -1144,16 +1168,21 @@ async function handleCommand(interaction) {
         updated_at: now(),
       });
 
+      // ✅ FINALIZA O COMANDO AGORA (para não travar)
+      await done(`✅ Email atualizado para **${email}**.`);
+
+      // ✅ Atualizações do ticket/menu em background (com timeout)
       if (interaction.channel && isTicketChannel(interaction.channel)) {
-        const topicObj = parseTopic(interaction.channel.topic || "");
+        const ch = interaction.channel;
+        const topicObj = parseTopic(ch.topic || "");
         if (String(topicObj.buyer || "") === interaction.user.id) {
           topicObj.email = email;
-          await interaction.channel.setTopic(buildTopic(topicObj)).catch(() => {});
-          await refreshTicketMenuMessage(interaction.channel, topicObj);
+
+          fireAndForget(withTimeout(ch.setTopic(buildTopic(topicObj)), CONFIG.DISCORD_OP_TIMEOUT_MS, "setTopic(setemail)"), "setTopic(setemail)");
+          fireAndForget(withTimeout(refreshTicketMenuMessage(ch, topicObj), CONFIG.DISCORD_OP_TIMEOUT_MS, "refreshMenu(setemail)"), "refreshMenu(setemail)");
         }
       }
-
-      return await done(`✅ Email atualizado para **${email}**.`);
+      return;
     }
 
     if (interaction.commandName === "setnick") {
@@ -1168,16 +1197,21 @@ async function handleCommand(interaction) {
         updated_at: now(),
       });
 
+      // ✅ FINALIZA O COMANDO AGORA
+      await done(`✅ Nick atualizado para **${nick}**.`);
+
+      // ✅ Atualizações em background (timeout)
       if (interaction.channel && isTicketChannel(interaction.channel)) {
-        const topicObj = parseTopic(interaction.channel.topic || "");
+        const ch = interaction.channel;
+        const topicObj = parseTopic(ch.topic || "");
         if (String(topicObj.buyer || "") === interaction.user.id) {
           topicObj.nick = nick;
-          await interaction.channel.setTopic(buildTopic(topicObj)).catch(() => {});
-          await refreshTicketMenuMessage(interaction.channel, topicObj);
+
+          fireAndForget(withTimeout(ch.setTopic(buildTopic(topicObj)), CONFIG.DISCORD_OP_TIMEOUT_MS, "setTopic(setnick)"), "setTopic(setnick)");
+          fireAndForget(withTimeout(refreshTicketMenuMessage(ch, topicObj), CONFIG.DISCORD_OP_TIMEOUT_MS, "refreshMenu(setnick)"), "refreshMenu(setnick)");
         }
       }
-
-      return await done(`✅ Nick atualizado para **${nick}**.`);
+      return;
     }
 
     return await done("⚠️ Comando desconhecido.");
@@ -1189,7 +1223,7 @@ async function handleCommand(interaction) {
   }
 }
 
-// ===================== MESSAGE CAPTURE (nick/email) =====================
+// ===================== CAPTURA NICK/EMAIL POR MENSAGEM =====================
 client.on("messageCreate", async (msg) => {
   try {
     if (!msg.guild) return;
@@ -1209,12 +1243,12 @@ client.on("messageCreate", async (msg) => {
     const text = String(msg.content || "").trim();
     if (!text) return;
 
-    const emailFound = extractEmailFromText(text);
-    const looksEmail = !!emailFound && isValidEmail(emailFound);
-
     const nickTopic = String(topicObj.nick || "").trim();
     const emailTopic = normalizeEmail(topicObj.email || "");
     const emailEmpty = isEmptyEmailValue(emailTopic);
+
+    const emailFound = extractEmailFromText(text);
+    const looksEmail = !!emailFound && isValidEmail(emailFound);
 
     // email sem nick -> avisar
     if (!nickTopic && looksEmail) {
@@ -1222,8 +1256,8 @@ client.on("messageCreate", async (msg) => {
       return;
     }
 
-    // salvar nick se não existe (e não é email)
-    if (!nickTopic) {
+    // salvar nick se não existe
+    if (!nickTopic && !looksEmail) {
       const nick = text;
 
       const current = stmtGetProfile.get(msg.author.id) || { nick: "", email: "" };
@@ -1236,44 +1270,45 @@ client.on("messageCreate", async (msg) => {
 
       topicObj.nick = nick;
 
+      // se já existe email no perfil, puxa pro topic
       const refreshed = stmtGetProfile.get(msg.author.id) || { nick, email: "" };
       const profileEmail = normalizeEmail(refreshed.email || "");
       if (profileEmail && emailEmpty) topicObj.email = profileEmail;
 
-      await channel.setTopic(buildTopic(topicObj)).catch(() => {});
-      await refreshTicketMenuMessage(channel, topicObj);
+      fireAndForget(withTimeout(channel.setTopic(buildTopic(topicObj)), CONFIG.DISCORD_OP_TIMEOUT_MS, "setTopic(msgNick)"), "setTopic(msgNick)");
+      fireAndForget(withTimeout(refreshTicketMenuMessage(channel, topicObj), CONFIG.DISCORD_OP_TIMEOUT_MS, "refreshMenu(msgNick)"), "refreshMenu(msgNick)");
 
       if (topicObj.email) {
-        await channel
-          .send(`✅ Nick salvo: **${nick}**\n✅ Email já está salvo: **${topicObj.email}**\nAgora clique no pack para gerar o link.`)
-          .catch(() => {});
+        await channel.send(`✅ Nick salvo: **${nick}**\n✅ Email já está salvo: **${topicObj.email}**\nAgora clique no pack.`).catch(() => {});
       } else {
         await channel.send(`✅ Nick salvo: **${nick}**\nAgora envie seu **email** (ou use /setemail).`).catch(() => {});
       }
       return;
     }
 
-    // salvar email se nick existe e email ainda não existe
-    if (looksEmail && emailEmpty) {
+    // salvar email se nick existe e email não existe
+    if (nickTopic && looksEmail && emailEmpty) {
       const email = normalizeEmail(emailFound);
 
+      const prof = stmtGetProfile.get(msg.author.id) || { nick: nickTopic, email: "" };
       stmtUpsertProfile.run({
         discord_id: msg.author.id,
-        nick: (stmtGetProfile.get(msg.author.id)?.nick || nickTopic || "").trim(),
+        nick: (prof.nick || nickTopic).trim(),
         email,
         updated_at: now(),
       });
 
       topicObj.email = email;
-      await channel.setTopic(buildTopic(topicObj)).catch(() => {});
-      await refreshTicketMenuMessage(channel, topicObj);
+
+      fireAndForget(withTimeout(channel.setTopic(buildTopic(topicObj)), CONFIG.DISCORD_OP_TIMEOUT_MS, "setTopic(msgEmail)"), "setTopic(msgEmail)");
+      fireAndForget(withTimeout(refreshTicketMenuMessage(channel, topicObj), CONFIG.DISCORD_OP_TIMEOUT_MS, "refreshMenu(msgEmail)"), "refreshMenu(msgEmail)");
 
       await channel.send(`✅ Email salvo: **${email}**\nAgora clique no pack para gerar o link.`).catch(() => {});
       return;
     }
 
-    // se já tem email e mandar outro -> instruir /setemail
-    if (looksEmail && !emailEmpty) {
+    // se já tem email e mandou outro -> /setemail
+    if (nickTopic && looksEmail && !emailEmpty) {
       await channel
         .send(`⚠️ Este ticket já tem email salvo: **${emailTopic}**\nSe quiser trocar, use **/setemail**.`)
         .catch(() => {});
@@ -1284,7 +1319,7 @@ client.on("messageCreate", async (msg) => {
   }
 });
 
-// ===================== INTERACTIONS (apenas 1 listener) =====================
+// ===================== INTERACTIONS (1 listener) =====================
 client.on("interactionCreate", async (interaction) => {
   try {
     if (interaction.isButton()) return await handleButton(interaction);
