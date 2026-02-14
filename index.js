@@ -5,6 +5,9 @@
  *  - /setnick e /setemail respondem IMEDIATO (não travam em setTopic/edit)
  *  - Email por mensagem funciona (nick primeiro, depois email)
  *  - Mantém: painel dedupe, ticket dedupe, pack lock, webhook MP /mp/webhook, SQLite
+ *  - Fix: pack não depende de topic (DB é a fonte de verdade)
+ *  - Fix: singleton lock no SQLite (evita 2 instâncias no Render)
+ *  - Fix: webhook MP ignora eventos que não são payment + ignora 404 Payment not found
  */
 
 require("dotenv").config();
@@ -29,6 +32,7 @@ const express = require("express");
 const axios = require("axios");
 const crypto = require("crypto");
 const Database = require("better-sqlite3");
+const { Rcon } = require("rcon-client");
 
 // ===================== BOOT =====================
 process.on("unhandledRejection", (err) => console.error("UNHANDLED REJECTION:", err));
@@ -69,9 +73,11 @@ const CONFIG = Object.freeze({
   MP_NOTIFICATION_URL: optionalEnv("MP_NOTIFICATION_URL", ""), // https://.../mp/webhook
   MP_WEBHOOK_SECRET: optionalEnv("MP_WEBHOOK_SECRET", ""),
 
-  // Entrega (sua API)
-  API_URL: requireEnv("API_URL"),
-  API_TOKEN: requireEnv("API_TOKEN"),
+// Entrega (Coins via RCON)
+RCON_HOST: optionalEnv("RCON_HOST", ""),
+RCON_PORT: Number(optionalEnv("RCON_PORT", "19132")),
+RCON_PASSWORD: optionalEnv("RCON_PASSWORD", ""),
+
 
   // Render
   PORT_FALLBACK: Number(optionalEnv("WEBHOOK_PORT", "10000")),
@@ -88,8 +94,8 @@ const CONFIG = Object.freeze({
   // Anti-trava interaction
   INTERACTION_WATCHDOG_MS: Number(optionalEnv("INTERACTION_WATCHDOG_MS", "12000")),
 
-  // Timeouts de Discord API (pra não pendurar)
-  DISCORD_OP_TIMEOUT_MS: Number(optionalEnv("DISCORD_OP_TIMEOUT_MS", "15000")),
+  // Timeouts Discord API (Render costuma ser mais lento)
+  DISCORD_OP_TIMEOUT_MS: Number(optionalEnv("DISCORD_OP_TIMEOUT_MS", "25000")),
 });
 
 if (!isSnowflake(CONFIG.LOG_CHANNEL_ID)) console.warn("⚠️ LOG_CHANNEL_ID inválido.");
@@ -129,6 +135,31 @@ const client = new Client({
 
 // ===================== SQLITE =====================
 const db = new Database("./loja.sqlite");
+
+// ===================== SINGLETON LOCK (EVITA 2 INSTÂNCIAS NO RENDER) =====================
+db.exec(`
+  CREATE TABLE IF NOT EXISTS instance_lock (
+    k TEXT PRIMARY KEY,
+    pid INTEGER NOT NULL,
+    started_at INTEGER NOT NULL
+  );
+`);
+
+function acquireSingletonOrExit() {
+  try {
+    const row = db.prepare(`SELECT pid, started_at FROM instance_lock WHERE k='singleton'`).get();
+    if (!row) {
+      db.prepare(`INSERT INTO instance_lock (k, pid, started_at) VALUES ('singleton', ?, ?)`).run(process.pid, Date.now());
+      console.log("🔒 singleton lock adquirido:", process.pid);
+      return;
+    }
+    console.log("🛑 Outra instância já está rodando. Encerrando esta:", process.pid, "lock pid:", row.pid);
+    process.exit(0);
+  } catch (e) {
+    console.log("⚠️ singleton lock falhou:", e?.message || e);
+  }
+}
+acquireSingletonOrExit();
 
 // perfil
 db.exec(`
@@ -192,15 +223,15 @@ const stmtFindPendingInChannel = db.prepare(`
 
 // ===================== STATE (RAM) =====================
 const STATE = {
-  openTickets: new Map(),        // buyerId -> channelId
-  cooldown: new Map(),           // buyerId -> ts
-  inactivityTimers: new Map(),   // channelId -> timeout
+  openTickets: new Map(), // buyerId -> channelId
+  cooldown: new Map(), // buyerId -> ts
+  inactivityTimers: new Map(), // channelId -> timeout
 
-  handledInteractions: new Map(),// interactionId -> ts
-  creatingTicket: new Set(),     // userId
-  packLocks: new Map(),          // channelId -> {until, by}
+  handledInteractions: new Map(), // interactionId -> ts
+  creatingTicket: new Set(), // userId
+  packLocks: new Map(), // channelId -> {until, by}
 
-  delivering: new Set(),         // paymentId lock
+  delivering: new Set(), // paymentId lock
 };
 
 // ===================== PROMISE HELPERS =====================
@@ -291,10 +322,12 @@ function createSafeResponder(interaction) {
         if (interaction.deferred || interaction.replied || acked) {
           await interaction.editReply({ content: "⚠️ Demorei para responder. Tente novamente agora." }).catch(() => {});
         } else {
-          await interaction.reply({
-            content: "⚠️ Demorei para responder. Tente novamente agora.",
-            flags: MessageFlags.Ephemeral,
-          }).catch(() => {});
+          await interaction
+            .reply({
+              content: "⚠️ Demorei para responder. Tente novamente agora.",
+              flags: MessageFlags.Ephemeral,
+            })
+            .catch(() => {});
         }
       } catch {
         await channelFallback("Demorei para responder. Tente novamente.");
@@ -332,7 +365,6 @@ function createSafeResponder(interaction) {
     }
   }
 
-  // ✅ PROGRESSO: não marca como finished
   async function progress(content) {
     const text = String(content ?? "");
     try {
@@ -344,7 +376,6 @@ function createSafeResponder(interaction) {
     } catch {}
   }
 
-  // ✅ FINAL: marca finished
   async function done(content) {
     if (finished) return;
     finished = true;
@@ -376,8 +407,7 @@ function createSafeResponder(interaction) {
   return { ack, progress, done };
 }
 
-
-// ===================== DEDUPE interaction.id =====================
+// ===================== DEDUPE interaction.id (RAM) =====================
 function isDupInteraction(interactionId) {
   const t = now();
   for (const [id, ts] of STATE.handledInteractions.entries()) {
@@ -464,18 +494,39 @@ async function sendPurchaseLog({
 }
 
 // ===================== ENTREGA (SUA API) =====================
-async function deliverToGame({ nick, packId, coins, orderId }) {
-  const url =
-    `${CONFIG.API_URL}?token=${encodeURIComponent(CONFIG.API_TOKEN)}` +
-    `&player=${encodeURIComponent(nick)}` +
-    `&pack=${encodeURIComponent(packId)}` +
-    `&coins=${encodeURIComponent(String(coins))}` +
-    `&orderId=${encodeURIComponent(orderId)}`;
+// ===================== ENTREGA (COINS via RCON) =====================
+async function deliverToGame({ nick, coins, orderId }) {
+  const host = String(CONFIG.RCON_HOST || "").trim();
+  const port = Number(CONFIG.RCON_PORT || 19132);
+  const password = String(CONFIG.RCON_PASSWORD || "").trim();
 
-  console.log("🎮 [GAME] chamando API:", url.replace(CONFIG.API_TOKEN, "***"));
-  const res = await axios.get(url, { timeout: 15000 });
-  console.log("🎮 [GAME] resposta:", res.data);
-  return res.data;
+  if (!host || !password) {
+    throw new Error("RCON não configurado (RCON_HOST/RCON_PASSWORD).");
+  }
+
+  const amount = Number(coins || 0);
+  if (!amount || amount < 1) throw new Error(`Quantidade de coins inválida: ${coins}`);
+
+  // Comando do plugin Coins:
+  // coins add <player> <amount>
+  const cmd = `coins add "${nick}" ${amount}`;
+
+  console.log(`🧩 [RCON] conectando ${host}:${port} | cmd=${cmd} | orderId=${orderId}`);
+
+  const rcon = await Rcon.connect({
+    host,
+    port,
+    password,
+    timeout: 8000,
+  });
+
+  try {
+    const resp = await rcon.send(cmd);
+    console.log("🧩 [RCON] resposta:", resp);
+    return { ok: true, resp };
+  } finally {
+    try { await rcon.end(); } catch {}
+  }
 }
 
 // ===================== MERCADO PAGO =====================
@@ -620,11 +671,11 @@ async function processPaymentFromWebhook(paymentId) {
     }
 
     const result = await deliverToGame({
-      nick: purchase.nick,
-      packId: purchase.pack_id,
-      coins: purchase.coins,
-      orderId,
-    });
+  nick: purchase.nick,
+  coins: purchase.coins,
+  orderId,
+});
+
 
     const ok = result && (result.ok === true || result.success === true);
 
@@ -688,7 +739,16 @@ async function processPaymentFromWebhook(paymentId) {
       await channel.send(`❌ Erro na entrega: \`${String(JSON.stringify(result))}\``).catch(() => {});
     }
   } catch (e) {
-    console.log("❌ processPaymentFromWebhook erro:", e?.response?.data || e?.message || e);
+    const status = e?.response?.status;
+    const data = e?.response?.data;
+
+    // ✅ Ignora eventos que não são paymentId real
+    if (status === 404 && String(data?.message || "").toLowerCase().includes("payment not found")) {
+      console.log("🟨 MP: payment not found (ignorando):", pid);
+      return;
+    }
+
+    console.log("❌ processPaymentFromWebhook erro:", data || e?.message || e);
   } finally {
     STATE.delivering.delete(pid);
   }
@@ -764,11 +824,10 @@ function buildPackRows(disabled = false) {
 async function refreshTicketMenuMessage(channel, topicObj) {
   if (!channel || !channel.isTextBased() || !isTicketChannel(channel)) return;
 
-  // ✅ Fonte de verdade: DB (pra não depender do topic)
+  // ✅ Fonte de verdade: DB
   const buyerId = String(topicObj.buyer || "").trim();
   const prof = buyerId ? (stmtGetProfile.get(buyerId) || { nick: "", email: "" }) : { nick: "", email: "" };
 
-  // Preferência: topic (se tiver) senão DB
   const nick = String(topicObj.nick || prof.nick || "").trim();
   const email = String(topicObj.email || prof.email || "").trim().toLowerCase();
 
@@ -779,12 +838,7 @@ async function refreshTicketMenuMessage(channel, topicObj) {
   const disablePacks = !!pending;
 
   try {
-    const menuMsg = await withTimeout(
-      channel.messages.fetch(menuMsgId),
-      CONFIG.DISCORD_OP_TIMEOUT_MS,
-      "fetch(menuMsg)"
-    );
-
+    const menuMsg = await withTimeout(channel.messages.fetch(menuMsgId), CONFIG.DISCORD_OP_TIMEOUT_MS, "fetch(menuMsg)");
     await withTimeout(
       menuMsg.edit({
         embeds: [buildTicketMenuEmbed({ nick, email })],
@@ -797,7 +851,6 @@ async function refreshTicketMenuMessage(channel, topicObj) {
     console.log("⚠️ refreshTicketMenuMessage falhou:", e?.message || e);
   }
 }
-
 
 async function sendOrEditPanel() {
   const guild = await client.guilds.fetch(CONFIG.GUILD_ID);
@@ -963,7 +1016,7 @@ async function createTicketChannel({ guild, user }) {
     });
 
     topicObj.menuMsgId = menuMsg.id;
-    await channel.setTopic(buildTopic(topicObj)).catch(() => {});
+    fireAndForget(withTimeout(channel.setTopic(buildTopic(topicObj)), CONFIG.DISCORD_OP_TIMEOUT_MS, "setTopic(openTicket)"), "setTopic(openTicket)");
 
     return { ok: true, channelId: channel.id };
   } catch (e) {
@@ -1043,6 +1096,7 @@ async function handleButton(interaction) {
 
       try {
         await progress("⏳ Gerando link de pagamento...");
+
         const pending = stmtFindPendingInChannel.get(channel.id);
         if (pending) {
           return await done(
@@ -1054,28 +1108,24 @@ async function handleButton(interaction) {
         const pack = PACKS.find((p) => p.id === packId);
         if (!pack) return await done("❌ Pack inválido.");
 
-      // ✅ Fonte de verdade: DB (não depende do topic)
-const prof = stmtGetProfile.get(interaction.user.id) || { nick: "", email: "" };
+        // ✅ Fonte de verdade: DB (não depende do topic)
+        const prof = stmtGetProfile.get(interaction.user.id) || { nick: "", email: "" };
+        const nick = String(topicObj.nick || prof.nick || "").trim();
+        const email = normalizeEmail(topicObj.email || prof.email || "");
 
-// Preferência: topic (se tiver) senão DB
-const nick = String(topicObj.nick || prof.nick || "").trim();
-const email = normalizeEmail(topicObj.email || prof.email || "");
+        if (!nick) return await done("❌ Envie seu nick (mensagem) ou use /setnick.");
+        if (!email) return await done("❌ Envie seu email (mensagem) ou use /setemail.");
+        if (!isValidEmail(email)) return await done("❌ Email inválido. Use /setemail para corrigir.");
 
-// validações
-if (!nick) return await done("❌ Envie seu nick (mensagem) ou use /setnick.");
-if (!email) return await done("❌ Envie seu email (mensagem) ou use /setemail.");
-if (!isValidEmail(email)) return await done("❌ Email inválido. Use /setemail para corrigir.");
-
-// (opcional, mas ajuda) tenta “reparar” o topic em background sem travar
-if (nick && String(topicObj.nick || "").trim() !== nick) {
-  topicObj.nick = nick;
-  fireAndForget(withTimeout(channel.setTopic(buildTopic(topicObj)), 15000, "setTopic(repairNick)"), "setTopic(repairNick)");
-}
-if (email && normalizeEmail(topicObj.email || "") !== email) {
-  topicObj.email = email;
-  fireAndForget(withTimeout(channel.setTopic(buildTopic(topicObj)), 15000, "setTopic(repairEmail)"), "setTopic(repairEmail)");
-}
-
+        // tenta reparar topic em background (não trava)
+        if (nick && String(topicObj.nick || "").trim() !== nick) {
+          topicObj.nick = nick;
+          fireAndForget(withTimeout(channel.setTopic(buildTopic(topicObj)), 15000, "setTopic(repairNick)"), "setTopic(repairNick)");
+        }
+        if (email && normalizeEmail(topicObj.email || "") !== email) {
+          topicObj.email = email;
+          fireAndForget(withTimeout(channel.setTopic(buildTopic(topicObj)), 15000, "setTopic(repairEmail)"), "setTopic(repairEmail)");
+        }
 
         const orderId = makeOrderId(interaction.user.id);
 
@@ -1109,12 +1159,12 @@ if (email && normalizeEmail(topicObj.email || "") !== email) {
           updated_at: now(),
         });
 
-        // Atualiza topic/menu sem travar (timeout)
+        // Atualiza topic/menu em background
         topicObj.pack = pack.id;
         topicObj.orderId = orderId;
         topicObj.paymentId = "";
-        fireAndForget(withTimeout(channel.setTopic(buildTopic(topicObj)), CONFIG.DISCORD_OP_TIMEOUT_MS, "setTopic(pack)"), "setTopic(pack)");
-        fireAndForget(withTimeout(refreshTicketMenuMessage(channel, topicObj), CONFIG.DISCORD_OP_TIMEOUT_MS, "refreshMenu(pack)"), "refreshMenu(pack)");
+        fireAndForget(withTimeout(channel.setTopic(buildTopic(topicObj)), 15000, "setTopic(pack)"), "setTopic(pack)");
+        fireAndForget(withTimeout(refreshTicketMenuMessage(channel, topicObj), 15000, "refreshMenu(pack)"), "refreshMenu(pack)");
 
         await channel
           .send(
@@ -1127,7 +1177,8 @@ if (email && normalizeEmail(topicObj.email || "") !== email) {
               `✅ Após aprovação, a entrega será automática.`
           )
           .catch(() => {});
-await done("✅ Link gerado! Veja a mensagem no ticket com o link de pagamento.");
+
+        await done("✅ Link gerado! Veja a mensagem no ticket com o link de pagamento.");
 
         await sendPurchaseLog({
           mode: "PROD",
@@ -1158,7 +1209,7 @@ await done("✅ Link gerado! Veja a mensagem no ticket com o link de pagamento."
   }
 }
 
-// ===================== COMMAND HANDLER (RESPONDE ANTES DE ATUALIZAR MENU/TOPIC) =====================
+// ===================== COMMAND HANDLER =====================
 async function handleCommand(interaction) {
   if (isDupInteraction(interaction.id)) return;
 
@@ -1171,7 +1222,6 @@ async function handleCommand(interaction) {
     if (interaction.commandName === "setemail") {
       const raw = String(interaction.options.getString("email", true));
       const email = normalizeEmail(raw);
-
       if (!isValidEmail(email)) return await done("❌ Email inválido.");
 
       const current = stmtGetProfile.get(interaction.user.id) || { nick: "", email: "" };
@@ -1182,18 +1232,15 @@ async function handleCommand(interaction) {
         updated_at: now(),
       });
 
-      // ✅ FINALIZA O COMANDO AGORA (para não travar)
       await done(`✅ Email atualizado para **${email}**.`);
 
-      // ✅ Atualizações do ticket/menu em background (com timeout)
       if (interaction.channel && isTicketChannel(interaction.channel)) {
         const ch = interaction.channel;
         const topicObj = parseTopic(ch.topic || "");
         if (String(topicObj.buyer || "") === interaction.user.id) {
           topicObj.email = email;
-
-          fireAndForget(withTimeout(ch.setTopic(buildTopic(topicObj)), CONFIG.DISCORD_OP_TIMEOUT_MS, "setTopic(setemail)"), "setTopic(setemail)");
-          fireAndForget(withTimeout(refreshTicketMenuMessage(ch, topicObj), CONFIG.DISCORD_OP_TIMEOUT_MS, "refreshMenu(setemail)"), "refreshMenu(setemail)");
+          fireAndForget(withTimeout(ch.setTopic(buildTopic(topicObj)), 15000, "setTopic(setemail)"), "setTopic(setemail)");
+          fireAndForget(withTimeout(refreshTicketMenuMessage(ch, topicObj), 15000, "refreshMenu(setemail)"), "refreshMenu(setemail)");
         }
       }
       return;
@@ -1211,18 +1258,15 @@ async function handleCommand(interaction) {
         updated_at: now(),
       });
 
-      // ✅ FINALIZA O COMANDO AGORA
       await done(`✅ Nick atualizado para **${nick}**.`);
 
-      // ✅ Atualizações em background (timeout)
       if (interaction.channel && isTicketChannel(interaction.channel)) {
         const ch = interaction.channel;
         const topicObj = parseTopic(ch.topic || "");
         if (String(topicObj.buyer || "") === interaction.user.id) {
           topicObj.nick = nick;
-
-          fireAndForget(withTimeout(ch.setTopic(buildTopic(topicObj)), CONFIG.DISCORD_OP_TIMEOUT_MS, "setTopic(setnick)"), "setTopic(setnick)");
-          fireAndForget(withTimeout(refreshTicketMenuMessage(ch, topicObj), CONFIG.DISCORD_OP_TIMEOUT_MS, "refreshMenu(setnick)"), "refreshMenu(setnick)");
+          fireAndForget(withTimeout(ch.setTopic(buildTopic(topicObj)), 15000, "setTopic(setnick)"), "setTopic(setnick)");
+          fireAndForget(withTimeout(refreshTicketMenuMessage(ch, topicObj), 15000, "refreshMenu(setnick)"), "refreshMenu(setnick)");
         }
       }
       return;
@@ -1289,8 +1333,8 @@ client.on("messageCreate", async (msg) => {
       const profileEmail = normalizeEmail(refreshed.email || "");
       if (profileEmail && emailEmpty) topicObj.email = profileEmail;
 
-      fireAndForget(withTimeout(channel.setTopic(buildTopic(topicObj)), CONFIG.DISCORD_OP_TIMEOUT_MS, "setTopic(msgNick)"), "setTopic(msgNick)");
-      fireAndForget(withTimeout(refreshTicketMenuMessage(channel, topicObj), CONFIG.DISCORD_OP_TIMEOUT_MS, "refreshMenu(msgNick)"), "refreshMenu(msgNick)");
+      fireAndForget(withTimeout(channel.setTopic(buildTopic(topicObj)), 15000, "setTopic(msgNick)"), "setTopic(msgNick)");
+      fireAndForget(withTimeout(refreshTicketMenuMessage(channel, topicObj), 15000, "refreshMenu(msgNick)"), "refreshMenu(msgNick)");
 
       if (topicObj.email) {
         await channel.send(`✅ Nick salvo: **${nick}**\n✅ Email já está salvo: **${topicObj.email}**\nAgora clique no pack.`).catch(() => {});
@@ -1314,8 +1358,8 @@ client.on("messageCreate", async (msg) => {
 
       topicObj.email = email;
 
-     fireAndForget(withTimeout(channel.setTopic(buildTopic(topicObj)), 12000, "setTopic(msgEmail)"), "setTopic(msgEmail)");
-      fireAndForget(withTimeout(refreshTicketMenuMessage(channel, topicObj), CONFIG.DISCORD_OP_TIMEOUT_MS, "refreshMenu(msgEmail)"), "refreshMenu(msgEmail)");
+      fireAndForget(withTimeout(channel.setTopic(buildTopic(topicObj)), 15000, "setTopic(msgEmail)"), "setTopic(msgEmail)");
+      fireAndForget(withTimeout(refreshTicketMenuMessage(channel, topicObj), 15000, "refreshMenu(msgEmail)"), "refreshMenu(msgEmail)");
 
       await channel.send(`✅ Email salvo: **${email}**\nAgora clique no pack para gerar o link.`).catch(() => {});
       return;
@@ -1378,12 +1422,19 @@ function startWebhookServer() {
 
     try {
       const dataId = String(req.body?.data?.id || req.query["data.id"] || req.query.id || "");
-      const topic = String(req.body?.type || req.query.type || "");
+      const topicRaw = String(req.body?.type || req.query.type || req.body?.topic || "").toLowerCase();
+
       const xSignature = req.headers["x-signature"];
       const xRequestId = req.headers["x-request-id"];
 
-      console.log("[MP WEBHOOK] recebido:", { topic, dataId });
+      console.log("[MP WEBHOOK] recebido:", { topic: topicRaw, dataId });
       if (!dataId) return;
+
+      // ✅ só processar pagamentos
+      if (topicRaw && topicRaw !== "payment") {
+        console.log("[MP WEBHOOK] ignorado (não é payment):", topicRaw, dataId);
+        return;
+      }
 
       const okSig = verifyMpSignature({ xSignature, xRequestId, dataId });
       if (!okSig) {
