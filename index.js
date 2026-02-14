@@ -239,19 +239,18 @@ function makeOrderId(userId) {
 }
 
 // ===================== SAFE REPLY (NUNCA trava) =====================
+// ===================== SAFE REPLY (NUNCA trava) =====================
 function createSafeResponder(interaction) {
   let triedDefer = false;
 
   async function ack() {
-    // tenta defer só uma vez
     if (interaction.deferred || interaction.replied || triedDefer) return;
     triedDefer = true;
 
     try {
+      // EPHEMERAL só aqui (ACK inicial)
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     } catch (e) {
-      // Se já foi acknowledged por outra execução, tudo bem.
-      // Não joga erro, só segue e depois tentamos editReply.
       const msg = e?.message || "";
       if (!msg.includes("already been acknowledged") && e?.code !== 40060) {
         console.log("⚠️ deferReply falhou:", msg);
@@ -260,37 +259,45 @@ function createSafeResponder(interaction) {
   }
 
   async function done(content) {
-    const payload = { content: String(content ?? ""), flags: MessageFlags.Ephemeral };
+    const text = String(content ?? "");
 
-    // 🔥 REGRA PRINCIPAL:
-    // SEMPRE tenta editReply primeiro (mesmo se não estiver deferred),
-    // porque se outra execução já respondeu, editReply ainda pode funcionar.
-    try {
-      await interaction.editReply(payload);
+    // ✅ Se já foi deferido ou já respondeu, usa editReply SEM flags
+    if (interaction.deferred || interaction.replied) {
+      try {
+        await interaction.editReply({ content: text });
+        return;
+      } catch (e) {
+        // se editReply falhar, tenta followUp (ephemeral)
+      }
+
+      try {
+        await interaction.followUp({ content: text, flags: MessageFlags.Ephemeral });
+        return;
+      } catch {}
       return;
-    } catch (e) {
-      // ignora, pode ser que não tenha response ainda
     }
 
-    // tenta reply
+    // ✅ Se ainda não reconheceu, tenta reply (ephemeral)
     try {
-      await interaction.reply(payload);
+      await interaction.reply({ content: text, flags: MessageFlags.Ephemeral });
       return;
     } catch (e) {
       const msg = e?.message || "";
-      // se já acknowledged, tenta editReply de novo (às vezes agora funciona)
+
+      // Se já foi acknowledged em algum lugar, tenta editReply SEM flags
       if (msg.includes("already been acknowledged") || e?.code === 40060) {
         try {
-          await interaction.editReply(payload);
+          await interaction.editReply({ content: text });
           return;
         } catch {}
       }
+
       console.log("⚠️ reply falhou:", msg);
     }
 
     // fallback final
     try {
-      await interaction.followUp(payload);
+      await interaction.followUp({ content: text, flags: MessageFlags.Ephemeral });
     } catch {}
   }
 
@@ -738,6 +745,22 @@ async function registerSlashCommands() {
   await rest.put(Routes.applicationGuildCommands(CONFIG.CLIENT_ID, CONFIG.GUILD_ID), { body: commands });
   console.log("✅ Slash commands registrados: /setnick /setemail");
 }
+function buildTicketEmbed(nick, email) {
+  return new EmbedBuilder()
+    .setColor("#FFD700")
+    .setTitle("🪙 Compra de Coins")
+    .setDescription(
+      "Siga os passos abaixo:\n\n" +
+      "**Passo 1:** Envie seu **nick** (ou use /setnick)\n" +
+      "**Passo 2:** Envie seu **email** (ou use /setemail)\n" +
+      "**Passo 3:** Clique no pack para gerar o link de pagamento\n"
+    )
+    .addFields(
+      { name: "👤 Nick salvo", value: nick || "—", inline: true },
+      { name: "📧 Email salvo", value: email || "—", inline: true }
+    )
+    .setFooter({ text: "Sistema automático • Entrega instantânea" });
+}
 
 // ===================== CACHE OPEN TICKETS =====================
 async function rebuildOpenTicketsCache(guild) {
@@ -1141,15 +1164,15 @@ async function handleCommand(interaction) {
 }
 
 // ===================== CAPTURA NICK/EMAIL POR MENSAGEM =====================
+// ===================== CAPTURA NICK/EMAIL POR MENSAGEM =====================
 client.on("messageCreate", async (msg) => {
   try {
     if (!msg.guild) return;
     if (msg.author?.bot) return;
 
     const channel = msg.channel;
-    if (!isTicketChannel(channel)) return;
-
-    resetInactivityTimer(channel);
+    if (!channel || channel.type !== ChannelType.GuildText) return;
+    if (!channel.name?.startsWith("ticket-")) return;
 
     const topicObj = parseTopic(channel.topic || "");
     const buyerId = String(topicObj.buyer || "").trim();
@@ -1159,12 +1182,21 @@ client.on("messageCreate", async (msg) => {
     const text = String(msg.content || "").trim();
     if (!text) return;
 
-    // Nick se vazio
+    const looksEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text);
     const nickTopic = String(topicObj.nick || "").trim();
+    const emailTopic = String(topicObj.email || "").trim().toLowerCase();
+
+    // 0) Se usuário mandou EMAIL mas ainda não tem NICK -> não salva como nick
+    if (!nickTopic && looksEmail) {
+      await channel.send("❌ Primeiro envie seu **nick**. Depois envie seu **email** (ou use /setemail).").catch(() => {});
+      return;
+    }
+
+    // 1) Salvar NICK se ainda não existe
     if (!nickTopic) {
       const nick = text;
-      const current = stmtGetProfile.get(msg.author.id) || { nick: "", email: "" };
 
+      const current = stmtGetProfile.get(msg.author.id) || { nick: "", email: "" };
       stmtUpsertProfile.run({
         discord_id: msg.author.id,
         nick,
@@ -1172,30 +1204,33 @@ client.on("messageCreate", async (msg) => {
         updated_at: now(),
       });
 
+      // atualiza topic com o nick
       topicObj.nick = nick;
+
+      // se já existe email no perfil, puxa pra topic também (pra não pedir email à toa)
+      const refreshed = stmtGetProfile.get(msg.author.id) || { nick, email: "" };
+      if (refreshed.email && !topicObj.email) topicObj.email = String(refreshed.email).trim().toLowerCase();
+
       await channel.setTopic(buildTopic(topicObj)).catch(() => {});
 
-      // atualiza embed menu
-      const menuMsgId = String(topicObj.menuMsgId || "").trim();
-      if (menuMsgId) {
-        try {
-          const menuMsg = await channel.messages.fetch(menuMsgId);
-          const email = String(topicObj.email || "").trim();
-          await menuMsg.edit({ embeds: [buildTicketMenuEmbed({ nick, email })] });
-        } catch {}
+      if (topicObj.email) {
+        await channel.send(
+          `✅ Nick salvo: **${nick}**\n✅ Email já está salvo: **${topicObj.email}**\nAgora clique no pack para gerar o link.`
+        ).catch(() => {});
+      } else {
+        await channel.send(`✅ Nick salvo: **${nick}**\nAgora envie seu **email** (ou use /setemail).`).catch(() => {});
       }
-
-      await channel.send(`✅ Nick salvo: **${nick}**\nAgora envie seu **email** (ou use /setemail).`).catch(() => {});
       return;
     }
 
-    // Email se vazio e parecer email
-    const emailTopic = String(topicObj.email || "").trim();
-    const looksEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text);
-    if (!emailTopic && looksEmail) {
-      const email = text.trim().toLowerCase();
-      const current = stmtGetProfile.get(msg.author.id) || { nick: "", email: "" };
+    // 2) Salvar EMAIL se ainda não existe
+    const emailIsEmpty =
+      !emailTopic || emailTopic === "undefined" || emailTopic === "null" || emailTopic === "-" || emailTopic === "0";
 
+    if (looksEmail && emailIsEmpty) {
+      const email = text.toLowerCase();
+
+      const current = stmtGetProfile.get(msg.author.id) || { nick: nickTopic, email: "" };
       stmtUpsertProfile.run({
         discord_id: msg.author.id,
         nick: current.nick || nickTopic,
@@ -1205,22 +1240,22 @@ client.on("messageCreate", async (msg) => {
 
       topicObj.email = email;
       await channel.setTopic(buildTopic(topicObj)).catch(() => {});
-
-      const menuMsgId = String(topicObj.menuMsgId || "").trim();
-      if (menuMsgId) {
-        try {
-          const menuMsg = await channel.messages.fetch(menuMsgId);
-          await menuMsg.edit({ embeds: [buildTicketMenuEmbed({ nick: nickTopic, email })] });
-        } catch {}
-      }
-
       await channel.send(`✅ Email salvo: **${email}**\nAgora clique no pack para gerar o link.`).catch(() => {});
+      return;
+    }
+
+    // 3) Se mandou email e já existe email -> avisa como trocar
+    if (looksEmail && !emailIsEmpty) {
+      await channel
+        .send(`⚠️ Este ticket já tem email salvo: **${emailTopic}**\nSe quiser trocar, use **/setemail**.`)
+        .catch(() => {});
       return;
     }
   } catch (e) {
     console.log("⚠️ messageCreate error:", e?.message || e);
   }
 });
+
 
 // ===================== INTERACTIONS =====================
 client.on("interactionCreate", async (interaction) => {
