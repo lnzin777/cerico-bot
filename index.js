@@ -23,7 +23,6 @@ const {
   REST,
   Routes,
   SlashCommandBuilder,
-  MessageFlags,
 } = require("discord.js");
 
 const express = require("express");
@@ -239,66 +238,85 @@ function makeOrderId(userId) {
 }
 
 // ===================== SAFE REPLY (NUNCA trava) =====================
-// ===================== SAFE REPLY (NUNCA trava) =====================
+// Regras obrigatórias:
+//  - Sempre deferReply({ ephemeral: true }) NO COMEÇO (até 2s)
+//  - Depois apenas editReply()
+//  - Se já foi ack, nunca tentar reply() de novo
 function createSafeResponder(interaction) {
-  let triedDefer = false;
+  let didAck = false;
+  let ackTried = false;
+
+  const isAcked = () => interaction.deferred || interaction.replied || didAck;
 
   async function ack() {
-    if (interaction.deferred || interaction.replied || triedDefer) return;
-    triedDefer = true;
+    if (isAcked() || ackTried) return;
+    ackTried = true;
 
     try {
-      // EPHEMERAL só aqui (ACK inicial)
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      await interaction.deferReply({ ephemeral: true }); // ✅ mais estável que flags
+      didAck = true;
     } catch (e) {
-      const msg = e?.message || "";
-      if (!msg.includes("already been acknowledged") && e?.code !== 40060) {
-        console.log("⚠️ deferReply falhou:", msg);
+      // Se já foi ack em outro lugar, ok (não quebra)
+      if (e?.code === 40060 || String(e?.message || "").includes("already been acknowledged")) {
+        didAck = true;
+        return;
       }
+      // Se for unknown interaction, não tem como responder mesmo (evita crash)
+      if (e?.code === 10062 || String(e?.message || "").includes("Unknown interaction")) {
+        return;
+      }
+      console.log("⚠️ deferReply falhou:", e?.code, e?.message || e);
     }
   }
 
   async function done(content) {
     const text = String(content ?? "");
 
-    // ✅ Se já foi deferido ou já respondeu, usa editReply SEM flags
+    // ✅ padrão: após ACK -> editReply
     if (interaction.deferred || interaction.replied) {
       try {
         await interaction.editReply({ content: text });
         return;
       } catch (e) {
-        // se editReply falhar, tenta followUp (ephemeral)
+        // se editReply falhar, tenta followUp ephemeral
+        try {
+          await interaction.followUp({ content: text, ephemeral: true });
+          return;
+        } catch {
+          return;
+        }
       }
-
-      try {
-        await interaction.followUp({ content: text, flags: MessageFlags.Ephemeral });
-        return;
-      } catch {}
-      return;
     }
 
-    // ✅ Se ainda não reconheceu, tenta reply (ephemeral)
+    // Se ainda não foi ack, tenta reply (ephemeral) o quanto antes.
     try {
-      await interaction.reply({ content: text, flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: text, ephemeral: true });
+      didAck = true;
       return;
     } catch (e) {
-      const msg = e?.message || "";
-
-      // Se já foi acknowledged em algum lugar, tenta editReply SEM flags
-      if (msg.includes("already been acknowledged") || e?.code === 40060) {
+      // Se já foi ack (40060), NÃO tente reply de novo. Tenta editReply / followUp.
+      if (e?.code === 40060 || String(e?.message || "").includes("already been acknowledged")) {
         try {
           await interaction.editReply({ content: text });
           return;
         } catch {}
+        try {
+          await interaction.followUp({ content: text, ephemeral: true });
+          return;
+        } catch {}
+        return;
       }
 
-      console.log("⚠️ reply falhou:", msg);
-    }
+      // Unknown interaction: não dá pra responder via interaction
+      if (e?.code === 10062 || String(e?.message || "").includes("Unknown interaction")) {
+        return;
+      }
 
-    // fallback final
-    try {
-      await interaction.followUp({ content: text, flags: MessageFlags.Ephemeral });
-    } catch {}
+      console.log("⚠️ reply falhou:", e?.code, e?.message || e);
+      try {
+        await interaction.followUp({ content: text, ephemeral: true });
+      } catch {}
+    }
   }
 
   return { ack, done };
@@ -392,7 +410,6 @@ async function sendPurchaseLog({
 
 // ===================== ENTREGA (SUA API) =====================
 async function deliverToGame({ nick, packId, coins, orderId }) {
-  // você pode adaptar a query conforme sua API real
   const url =
     `${CONFIG.API_URL}?token=${encodeURIComponent(CONFIG.API_TOKEN)}` +
     `&player=${encodeURIComponent(nick)}` +
@@ -443,7 +460,7 @@ async function createCheckoutPreference({ pack, buyerId, nick, email, orderId })
     timeout: 20000,
   });
 
-  return res.data; // { id, init_point, ... }
+  return res.data;
 }
 
 async function getPayment(paymentId) {
@@ -512,7 +529,6 @@ async function processPaymentFromWebhook(paymentId) {
       return;
     }
 
-    // atualiza status/payment no DB
     stmtUpdatePurchase.run({
       order_id: orderId,
       payment_id: pid,
@@ -521,7 +537,6 @@ async function processPaymentFromWebhook(paymentId) {
       updated_at: now(),
     });
 
-    // se não aprovado, só loga e sai
     if (status !== "approved") {
       await sendPurchaseLog({
         mode: "PROD",
@@ -539,7 +554,6 @@ async function processPaymentFromWebhook(paymentId) {
       return;
     }
 
-    // idempotência final
     const refreshed = stmtGetPurchaseByOrder.get(orderId);
     if (refreshed && refreshed.status === "DELIVERED") return;
 
@@ -598,7 +612,6 @@ async function processPaymentFromWebhook(paymentId) {
       return;
     }
 
-    // falhou entrega
     stmtUpdatePurchase.run({
       order_id: orderId,
       payment_id: pid,
@@ -698,6 +711,28 @@ function buildPackRows(disabled = false) {
   return rows;
 }
 
+async function refreshTicketMenuMessage(channel, topicObj) {
+  if (!channel || !channel.isTextBased() || !isTicketChannel(channel)) return;
+
+  const nick = String(topicObj.nick || "").trim();
+  const email = String(topicObj.email || "").trim();
+  const menuMsgId = String(topicObj.menuMsgId || "").trim();
+
+  const pending = stmtFindPendingInChannel.get(channel.id);
+  const disablePacks = !!pending;
+
+  if (!menuMsgId) return;
+  try {
+    const menuMsg = await channel.messages.fetch(menuMsgId);
+    await menuMsg.edit({
+      embeds: [buildTicketMenuEmbed({ nick, email })],
+      components: buildPackRows(disablePacks),
+    });
+  } catch {
+    // se não achar a msg, não quebra o fluxo
+  }
+}
+
 async function sendOrEditPanel() {
   const guild = await client.guilds.fetch(CONFIG.GUILD_ID);
   const channel = await guild.channels.fetch(CONFIG.PANEL_CHANNEL_ID).catch(() => null);
@@ -745,22 +780,6 @@ async function registerSlashCommands() {
   await rest.put(Routes.applicationGuildCommands(CONFIG.CLIENT_ID, CONFIG.GUILD_ID), { body: commands });
   console.log("✅ Slash commands registrados: /setnick /setemail");
 }
-function buildTicketEmbed(nick, email) {
-  return new EmbedBuilder()
-    .setColor("#FFD700")
-    .setTitle("🪙 Compra de Coins")
-    .setDescription(
-      "Siga os passos abaixo:\n\n" +
-      "**Passo 1:** Envie seu **nick** (ou use /setnick)\n" +
-      "**Passo 2:** Envie seu **email** (ou use /setemail)\n" +
-      "**Passo 3:** Clique no pack para gerar o link de pagamento\n"
-    )
-    .addFields(
-      { name: "👤 Nick salvo", value: nick || "—", inline: true },
-      { name: "📧 Email salvo", value: email || "—", inline: true }
-    )
-    .setFooter({ text: "Sistema automático • Entrega instantânea" });
-}
 
 // ===================== CACHE OPEN TICKETS =====================
 async function rebuildOpenTicketsCache(guild) {
@@ -798,14 +817,12 @@ function canCloseTicket(interaction, buyerId) {
 async function createTicketChannel({ guild, user }) {
   const ts = now();
 
-  // cooldown
   const last = STATE.cooldown.get(user.id) || 0;
   if (ts - last < CONFIG.TICKET_COOLDOWN_MS) {
     const wait = Math.ceil((CONFIG.TICKET_COOLDOWN_MS - (ts - last)) / 1000);
     return { ok: false, reason: `Aguarde ${wait}s para abrir outro ticket.` };
   }
 
-  // já aberto?
   const cached = STATE.openTickets.get(user.id);
   if (cached) {
     const existing = await guild.channels.fetch(cached).catch(() => null);
@@ -815,7 +832,6 @@ async function createTicketChannel({ guild, user }) {
     STATE.openTickets.delete(user.id);
   }
 
-  // lock por user (anti duplo clique)
   if (STATE.creatingTicket.has(user.id)) {
     return { ok: false, reason: "Estou criando seu ticket… aguarde um instante." };
   }
@@ -851,7 +867,7 @@ async function createTicketChannel({ guild, user }) {
     const topicObj = {
       buyer: user.id,
       nick: (profile.nick || "").trim(),
-      email: (profile.email || "").trim(),
+      email: (profile.email || "").trim().toLowerCase(),
       pack: "",
       orderId: "",
       paymentId: "",
@@ -910,14 +926,14 @@ function releasePackLock(channelId) {
 
 // ===================== BUTTON HANDLER =====================
 async function handleButton(interaction) {
-  // dedupe pelo id da interaction (evita processar 2x)
   if (isDupInteraction(interaction.id)) return;
 
   const { ack, done } = createSafeResponder(interaction);
 
-  try {
-    await ack();
+  // ✅ ACK cedo, antes de qualquer lógica pesada
+  await ack();
 
+  try {
     const customId = interaction.customId;
     console.log("[BTN]", customId, "by", interaction.user.id, "in", interaction.channelId);
 
@@ -961,7 +977,6 @@ async function handleButton(interaction) {
       try {
         await done("⏳ Gerando link de pagamento...");
 
-        // se já tem pendente, não gera outro
         const pending = stmtFindPendingInChannel.get(channel.id);
         if (pending) {
           return await done(
@@ -974,7 +989,7 @@ async function handleButton(interaction) {
         if (!pack) return await done("❌ Pack inválido.");
 
         const nick = String(topicObj.nick || "").trim();
-        const email = String(topicObj.email || "").trim();
+        const email = String(topicObj.email || "").trim().toLowerCase();
 
         if (!nick) return await done("❌ Envie seu nick (mensagem) ou use /setnick.");
         if (!email) return await done("❌ Envie seu email (mensagem) ou use /setemail.");
@@ -1011,25 +1026,13 @@ async function handleButton(interaction) {
           updated_at: now(),
         });
 
-        // atualiza topic
         topicObj.pack = pack.id;
         topicObj.orderId = orderId;
         topicObj.paymentId = "";
         await channel.setTopic(buildTopic(topicObj)).catch(() => {});
 
-        // desabilita botões do menu original (se existir)
-        const menuMsgId = String(topicObj.menuMsgId || "").trim();
-        if (menuMsgId) {
-          try {
-            const menuMsg = await channel.messages.fetch(menuMsgId);
-            await menuMsg.edit({
-              embeds: [buildTicketMenuEmbed({ nick, email })],
-              components: buildPackRows(true),
-            });
-          } catch {
-            await channel.send({ content: "🔒 Packs bloqueados (aguardando pagamento).", components: buildPackRows(true) }).catch(() => {});
-          }
-        }
+        // ✅ atualiza menu e trava packs (pendente)
+        await refreshTicketMenuMessage(channel, topicObj);
 
         await channel
           .send(
@@ -1057,7 +1060,7 @@ async function handleButton(interaction) {
           timestamp: now(),
         });
 
-        return; // já respondemos via done()
+        return; // resposta já foi pelo done()
       } finally {
         releasePackLock(channel.id);
       }
@@ -1078,8 +1081,10 @@ async function handleCommand(interaction) {
 
   const { ack, done } = createSafeResponder(interaction);
 
+  // ✅ ACK cedo
+  await ack();
+
   try {
-    await ack();
     console.log("[CMD]", interaction.commandName, "by", interaction.user.id, "in", interaction.channelId);
 
     if (interaction.commandName === "setemail") {
@@ -1096,23 +1101,13 @@ async function handleCommand(interaction) {
         updated_at: now(),
       });
 
-      // se estiver no ticket do buyer, atualiza topic e embed do menu
+      // se estiver no ticket do buyer, atualiza topic e menu
       if (interaction.channel && isTicketChannel(interaction.channel)) {
         const topicObj = parseTopic(interaction.channel.topic || "");
         if (String(topicObj.buyer || "") === interaction.user.id) {
           topicObj.email = email;
           await interaction.channel.setTopic(buildTopic(topicObj)).catch(() => {});
-
-          const menuMsgId = String(topicObj.menuMsgId || "").trim();
-          if (menuMsgId) {
-            try {
-              const menuMsg = await interaction.channel.messages.fetch(menuMsgId);
-              const nick = String(topicObj.nick || "").trim();
-              await menuMsg.edit({
-                embeds: [buildTicketMenuEmbed({ nick, email })],
-              });
-            } catch {}
-          }
+          await refreshTicketMenuMessage(interaction.channel, topicObj);
         }
       }
 
@@ -1136,17 +1131,7 @@ async function handleCommand(interaction) {
         if (String(topicObj.buyer || "") === interaction.user.id) {
           topicObj.nick = nick;
           await interaction.channel.setTopic(buildTopic(topicObj)).catch(() => {});
-
-          const menuMsgId = String(topicObj.menuMsgId || "").trim();
-          if (menuMsgId) {
-            try {
-              const menuMsg = await interaction.channel.messages.fetch(menuMsgId);
-              const email = String(topicObj.email || "").trim();
-              await menuMsg.edit({
-                embeds: [buildTicketMenuEmbed({ nick, email })],
-              });
-            } catch {}
-          }
+          await refreshTicketMenuMessage(interaction.channel, topicObj);
         }
       }
 
@@ -1156,14 +1141,12 @@ async function handleCommand(interaction) {
     return await done("⚠️ Comando desconhecido.");
   } catch (err) {
     console.error("❌ handleCommand crash:", err);
-    // evita ficar "pensando" para sempre
     try {
       await done("❌ Deu erro no comando. Veja os logs do Render.");
     } catch {}
   }
 }
 
-// ===================== CAPTURA NICK/EMAIL POR MENSAGEM =====================
 // ===================== CAPTURA NICK/EMAIL POR MENSAGEM =====================
 client.on("messageCreate", async (msg) => {
   try {
@@ -1179,20 +1162,20 @@ client.on("messageCreate", async (msg) => {
     if (!buyerId) return;
     if (msg.author.id !== buyerId) return;
 
+    resetInactivityTimer(channel);
+
     const text = String(msg.content || "").trim();
     if (!text) return;
 
     const looksEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text);
     const nickTopic = String(topicObj.nick || "").trim();
-   const emailTopicRaw = String(topicObj.email ?? "").trim();
-const emailTopic = emailTopicRaw.toLowerCase();
+    const emailTopicRaw = String(topicObj.email ?? "").trim();
+    const emailTopic = emailTopicRaw.toLowerCase();
 
-const emailIsEmpty =
-  !emailTopic ||
-  ["undefined", "null", "-", "—", "–", "0"].includes(emailTopic);
+    const emailIsEmpty =
+      !emailTopic || ["undefined", "null", "-", "—", "–", "0"].includes(emailTopic);
 
-
-    // 0) Se usuário mandou EMAIL mas ainda não tem NICK -> não salva como nick
+    // Regra: se mandou email sem nick -> avisa "primeiro nick"
     if (!nickTopic && looksEmail) {
       await channel.send("❌ Primeiro envie seu **nick**. Depois envie seu **email** (ou use /setemail).").catch(() => {});
       return;
@@ -1210,28 +1193,27 @@ const emailIsEmpty =
         updated_at: now(),
       });
 
-      // atualiza topic com o nick
       topicObj.nick = nick;
 
-      // se já existe email no perfil, puxa pra topic também (pra não pedir email à toa)
+      // puxa email do perfil se existir
       const refreshed = stmtGetProfile.get(msg.author.id) || { nick, email: "" };
-      if (refreshed.email && !topicObj.email) topicObj.email = String(refreshed.email).trim().toLowerCase();
+      const profileEmail = String(refreshed.email || "").trim().toLowerCase();
+      if (profileEmail && !String(topicObj.email || "").trim()) topicObj.email = profileEmail;
 
       await channel.setTopic(buildTopic(topicObj)).catch(() => {});
+      await refreshTicketMenuMessage(channel, topicObj);
 
       if (topicObj.email) {
-        await channel.send(
-          `✅ Nick salvo: **${nick}**\n✅ Email já está salvo: **${topicObj.email}**\nAgora clique no pack para gerar o link.`
-        ).catch(() => {});
+        await channel
+          .send(`✅ Nick salvo: **${nick}**\n✅ Email já está salvo: **${topicObj.email}**\nAgora clique no pack para gerar o link.`)
+          .catch(() => {});
       } else {
         await channel.send(`✅ Nick salvo: **${nick}**\nAgora envie seu **email** (ou use /setemail).`).catch(() => {});
       }
       return;
     }
 
-    // 2) Salvar EMAIL se ainda não existe
-   
-
+    // 2) Salvar EMAIL se ainda não existe (nick já existe)
     if (looksEmail && emailIsEmpty) {
       const email = text.toLowerCase();
 
@@ -1245,22 +1227,25 @@ const emailIsEmpty =
 
       topicObj.email = email;
       await channel.setTopic(buildTopic(topicObj)).catch(() => {});
+      await refreshTicketMenuMessage(channel, topicObj);
+
       await channel.send(`✅ Email salvo: **${email}**\nAgora clique no pack para gerar o link.`).catch(() => {});
       return;
     }
 
-    // 3) Se mandou email e já existe email -> avisa como trocar
+    // 3) Se mandou outro email e já existe email -> instruir usar /setemail
     if (looksEmail && !emailIsEmpty) {
       await channel
         .send(`⚠️ Este ticket já tem email salvo: **${emailTopic}**\nSe quiser trocar, use **/setemail**.`)
         .catch(() => {});
       return;
     }
+
+    // Se não parece email e já tem nick, não faz nada (evita salvar lixo como email)
   } catch (e) {
     console.log("⚠️ messageCreate error:", e?.message || e);
   }
 });
-
 
 // ===================== INTERACTIONS =====================
 client.on("interactionCreate", async (interaction) => {
@@ -1303,7 +1288,6 @@ function startWebhookServer() {
   app.get("/health", (_, res) => res.json({ ok: true }));
 
   app.post("/mp/webhook", async (req, res) => {
-    // responde rápido pro MP
     res.sendStatus(200);
 
     try {
