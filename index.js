@@ -240,42 +240,55 @@ function makeOrderId(userId) {
 
 // ===================== SAFE REPLY (NUNCA trava) =====================
 function createSafeResponder(interaction) {
-  let deferredHere = false;
+  let triedDefer = false;
 
   async function ack() {
-    if (interaction.deferred || interaction.replied || deferredHere) return;
-    deferredHere = true;
+    // tenta defer só uma vez
+    if (interaction.deferred || interaction.replied || triedDefer) return;
+    triedDefer = true;
+
     try {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-    } catch {
-      // já foi ackado por algum motivo, ignora
+    } catch (e) {
+      // Se já foi acknowledged por outra execução, tudo bem.
+      // Não joga erro, só segue e depois tentamos editReply.
+      const msg = e?.message || "";
+      if (!msg.includes("already been acknowledged") && e?.code !== 40060) {
+        console.log("⚠️ deferReply falhou:", msg);
+      }
     }
   }
 
   async function done(content) {
     const payload = { content: String(content ?? ""), flags: MessageFlags.Ephemeral };
 
-    // se já deferiu, SEMPRE editReply
-    if (interaction.deferred) {
-      try {
-        await interaction.editReply(payload);
-        return;
-      } catch (e) {
-        console.log("⚠️ editReply falhou:", e?.message || e);
-      }
+    // 🔥 REGRA PRINCIPAL:
+    // SEMPRE tenta editReply primeiro (mesmo se não estiver deferred),
+    // porque se outra execução já respondeu, editReply ainda pode funcionar.
+    try {
+      await interaction.editReply(payload);
+      return;
+    } catch (e) {
+      // ignora, pode ser que não tenha response ainda
     }
 
-    // se ainda não respondeu, reply
-    if (!interaction.replied) {
-      try {
-        await interaction.reply(payload);
-        return;
-      } catch (e) {
-        console.log("⚠️ reply falhou:", e?.message || e);
+    // tenta reply
+    try {
+      await interaction.reply(payload);
+      return;
+    } catch (e) {
+      const msg = e?.message || "";
+      // se já acknowledged, tenta editReply de novo (às vezes agora funciona)
+      if (msg.includes("already been acknowledged") || e?.code === 40060) {
+        try {
+          await interaction.editReply(payload);
+          return;
+        } catch {}
       }
+      console.log("⚠️ reply falhou:", msg);
     }
 
-    // fallback
+    // fallback final
     try {
       await interaction.followUp(payload);
     } catch {}
