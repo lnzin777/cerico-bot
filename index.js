@@ -23,7 +23,6 @@ const {
   REST,
   Routes,
   SlashCommandBuilder,
-  MessageFlags,
 } = require("discord.js");
 
 const express = require("express");
@@ -60,15 +59,15 @@ const CONFIG = Object.freeze({
   CLIENT_ID: requireEnv("CLIENT_ID"),
   GUILD_ID: requireEnv("GUILD_ID"),
   PANEL_CHANNEL_ID: requireEnv("PANEL_CHANNEL_ID"),
-  PANEL_MESSAGE_ID: optionalEnv("PANEL_MESSAGE_ID", ""), // se vazio, cria e mostra no log
+  PANEL_MESSAGE_ID: optionalEnv("PANEL_MESSAGE_ID", ""),
   TICKET_CATEGORY_ID: requireEnv("TICKET_CATEGORY_ID"),
   LOG_CHANNEL_ID: requireEnv("LOG_CHANNEL_ID"),
   SUPPORT_ROLE_ID: optionalEnv("SUPPORT_ROLE_ID", ""),
 
   // Mercado Pago
   MP_ACCESS_TOKEN: requireEnv("MP_ACCESS_TOKEN"),
-  MP_NOTIFICATION_URL: optionalEnv("MP_NOTIFICATION_URL", ""), // recomendado: https://cerico-bot.onrender.com/mp/webhook
-  MP_WEBHOOK_SECRET: optionalEnv("MP_WEBHOOK_SECRET", ""), // se não tiver, deixa vazio (signature OFF)
+  MP_NOTIFICATION_URL: optionalEnv("MP_NOTIFICATION_URL", ""),
+  MP_WEBHOOK_SECRET: optionalEnv("MP_WEBHOOK_SECRET", ""),
 
   // Entrega (sua API)
   API_URL: requireEnv("API_URL"),
@@ -76,7 +75,7 @@ const CONFIG = Object.freeze({
 
   // Timers
   TICKET_COOLDOWN_MS: Number(optionalEnv("TICKET_COOLDOWN_MS", "60000")),
-  INACTIVITY_CLOSE_MS: Number(optionalEnv("INACTIVITY_CLOSE_MS", String(10 * 60 * 1000))), // 10 min
+  INACTIVITY_CLOSE_MS: Number(optionalEnv("INACTIVITY_CLOSE_MS", String(10 * 60 * 1000))),
   DELETE_DELAY_MS: Number(optionalEnv("DELETE_DELAY_MS", "2500")),
   AUTO_CLOSE_AFTER_DELIVERY_MS: Number(optionalEnv("AUTO_CLOSE_AFTER_DELIVERY_MS", "8000")),
 
@@ -95,21 +94,21 @@ const CONFIG = Object.freeze({
 if (!isSnowflake(CONFIG.LOG_CHANNEL_ID)) console.warn("⚠️ LOG_CHANNEL_ID parece inválido (só números).");
 if (CONFIG.SUPPORT_ROLE_ID && !isSnowflake(CONFIG.SUPPORT_ROLE_ID)) console.warn("⚠️ SUPPORT_ROLE_ID parece inválido.");
 
-// ===================== COINS / PACKS =====================
-const COIN_BASE_BRL = 1.0; // 1 coin = R$ 1,00
+console.log(`🔎 MP signature check: ${CONFIG.MP_WEBHOOK_SECRET ? "ON" : "OFF"}`);
 
-// descontos: <= 2,5% nos menores; 500 com 5%
+// ===================== COINS / PACKS =====================
+const COIN_BASE_BRL = 1.0;
+
 const PACKS = Object.freeze([
   { id: "c5", coins: 5, discount: 0.0, emoji: "🟢" },
-  { id: "c10", coins: 10, discount: 0.005, emoji: "🟡" }, // 0,5%
-  { id: "c25", coins: 25, discount: 0.01, emoji: "🟠" }, // 1%
-  { id: "c50", coins: 50, discount: 0.015, emoji: "🔴" }, // 1,5%
-  { id: "c100", coins: 100, discount: 0.025, emoji: "🔷" }, // 2,5%
-  { id: "c500", coins: 500, discount: 0.05, emoji: "👑" }, // 5%
+  { id: "c10", coins: 10, discount: 0.005, emoji: "🟡" },
+  { id: "c25", coins: 25, discount: 0.01, emoji: "🟠" },
+  { id: "c50", coins: 50, discount: 0.015, emoji: "🔴" },
+  { id: "c100", coins: 100, discount: 0.025, emoji: "🔷" },
+  { id: "c500", coins: 500, discount: 0.05, emoji: "👑" },
 ]);
 
 function roundUpTo050(value) {
-  // arredonda pra cima em múltiplos de 0,50
   return Math.ceil(value * 2) / 2;
 }
 function calculatePriceBRL(pack) {
@@ -130,7 +129,7 @@ const client = new Client({
 // ===================== SQLITE =====================
 const db = new Database("./loja.sqlite");
 
-// ---- lock de instância (anti 2 bots ao mesmo tempo) ----
+// ---- lock de instância ----
 db.exec(`
   CREATE TABLE IF NOT EXISTS bot_lock (
     key TEXT PRIMARY KEY,
@@ -147,7 +146,6 @@ function instanceOwnerId() {
   const salt = crypto.randomBytes(3).toString("hex");
   return `pid:${process.pid}:${salt}`;
 }
-
 const INSTANCE = {
   key: `guild:${CONFIG.GUILD_ID}`,
   owner: instanceOwnerId(),
@@ -180,8 +178,8 @@ function tryAcquireInstanceLockOrExit() {
 
 function startInstanceHeartbeat() {
   if (!INSTANCE.hasLock) return;
-
   if (INSTANCE.heartbeatTimer) clearInterval(INSTANCE.heartbeatTimer);
+
   INSTANCE.heartbeatTimer = setInterval(() => {
     try {
       const t = now();
@@ -190,16 +188,19 @@ function startInstanceHeartbeat() {
         console.error("🛑 Perdi o lock de instância. Encerrando para evitar duplicação.");
         process.exit(1);
       }
-      stmtUpdateLock.run({ key: INSTANCE.key, owner: INSTANCE.owner, expires_at: t + CONFIG.INSTANCE_LOCK_TTL_MS, updated_at: t });
+      stmtUpdateLock.run({
+        key: INSTANCE.key,
+        owner: INSTANCE.owner,
+        expires_at: t + CONFIG.INSTANCE_LOCK_TTL_MS,
+        updated_at: t,
+      });
     } catch (e) {
       console.error("⚠️ heartbeat lock erro:", e?.message || e);
     }
   }, CONFIG.INSTANCE_HEARTBEAT_MS);
 }
 
-console.log(`🔎 MP signature check: ${CONFIG.MP_WEBHOOK_SECRET ? "ON" : "OFF"}`);
-
-// ---- perfil do usuário ----
+// ---- perfil ----
 db.exec(`
   CREATE TABLE IF NOT EXISTS user_profile (
     discord_id TEXT PRIMARY KEY,
@@ -222,7 +223,7 @@ db.exec(`
     pack_id TEXT NOT NULL,
     coins INTEGER NOT NULL,
     amount REAL NOT NULL,
-    status TEXT NOT NULL, -- PENDING / APPROVED / DELIVERED / DELIVERY_ERROR / etc
+    status TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
   );
@@ -257,13 +258,13 @@ const stmtFindPendingInChannel = db.prepare(`
 
 // ===================== STATE (RAM) =====================
 const STATE = {
-  openTickets: new Map(),          // buyerId -> channelId
-  cooldown: new Map(),             // buyerId -> ts
-  inactivityTimers: new Map(),     // channelId -> timeout
-  generatingTicket: new Set(),     // "GEN:userId"
-  delivering: new Set(),           // paymentId (runtime lock)
-  handledInteractions: new Map(),  // interactionId -> ts
-  packLocks: new Map(),            // channelId -> { until, by }
+  openTickets: new Map(),
+  cooldown: new Map(),
+  inactivityTimers: new Map(),
+  generatingTicket: new Set(),
+  delivering: new Set(),
+  handledInteractions: new Map(),
+  packLocks: new Map(),
 };
 
 // ===================== TOPIC HELPERS =====================
@@ -334,7 +335,7 @@ function resetInactivityTimer(channel) {
   STATE.inactivityTimers.set(channel.id, t);
 }
 
-// ===================== SAFE RESPONDER (ANTI “PENSANDO INFINITO”) =====================
+// ===================== SAFE RESPONDER (BUG FIX AQUI) =====================
 function createSafeResponder(interaction) {
   let didDefer = false;
 
@@ -342,22 +343,35 @@ function createSafeResponder(interaction) {
     if (interaction.deferred || interaction.replied || didDefer) return;
     didDefer = true;
     try {
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      // ✅ use ephemeral: true (sem flags)
+      await interaction.deferReply({ ephemeral: true });
     } catch {
       // ignora
     }
   }
 
   async function respond(content, extra = {}) {
-    const payload = { content: String(content ?? ""), flags: MessageFlags.Ephemeral, ...extra };
+    const payload = { content: String(content ?? ""), ...extra };
 
+    // ✅ editReply NÃO pode receber flags/ephemeral
     if (interaction.deferred) {
-      try { return await interaction.editReply(payload); } catch {}
+      try {
+        return await interaction.editReply(payload);
+      } catch {}
     }
+
+    // ✅ reply pode ser ephemeral
     if (!interaction.replied) {
-      try { return await interaction.reply(payload); } catch {}
+      try {
+        return await interaction.reply({ ...payload, ephemeral: true });
+      } catch {}
     }
-    try { return await interaction.followUp(payload); } catch {}
+
+    // ✅ followUp pode ser ephemeral
+    try {
+      return await interaction.followUp({ ...payload, ephemeral: true });
+    } catch {}
+
     return null;
   }
 
@@ -455,7 +469,7 @@ async function createCheckoutPreference({ pack, buyerId, nick, email, orderId })
     timeout: 20000,
   });
 
-  return res.data; // { id, init_point, ... }
+  return res.data;
 }
 
 async function getPayment(paymentId) {
@@ -468,7 +482,6 @@ async function getPayment(paymentId) {
 
 // ===================== WEBHOOK SIGNATURE =====================
 function verifyMpSignature({ xSignature, xRequestId, dataId }) {
-  // se você não tem secret, fica OFF e aceita
   if (!CONFIG.MP_WEBHOOK_SECRET) return true;
 
   try {
@@ -496,34 +509,22 @@ function verifyMpSignature({ xSignature, xRequestId, dataId }) {
 
 // ===================== PROCESSA PAGAMENTO =====================
 async function processPaymentFromWebhook(paymentId) {
-  if (STATE.delivering.has(paymentId)) {
-    console.log("🟨 delivery lock ativo p/ paymentId:", paymentId);
-    return;
-  }
+  if (STATE.delivering.has(paymentId)) return;
   STATE.delivering.add(paymentId);
 
   try {
     const existingByPay = stmtGetPurchaseByPayment.get(String(paymentId));
-    if (existingByPay && existingByPay.status === "DELIVERED") {
-      console.log("🟨 Já entregue (DB) paymentId:", paymentId);
-      return;
-    }
+    if (existingByPay && existingByPay.status === "DELIVERED") return;
 
     const payment = await getPayment(paymentId);
     const status = String(payment?.status || "unknown");
     const orderId = String(payment?.external_reference || "");
 
-    console.log("[MP] payment", paymentId, "status", status, "orderId", orderId);
-
     if (!orderId) return;
 
     const purchase = stmtGetPurchaseByOrder.get(orderId);
-    if (!purchase) {
-      console.log("⚠️ Compra não encontrada no DB (orderId):", orderId);
-      return;
-    }
+    if (!purchase) return;
 
-    // atualiza status/payment no DB
     stmtUpdatePurchaseStatus.run({
       order_id: orderId,
       payment_id: String(paymentId),
@@ -553,7 +554,7 @@ async function processPaymentFromWebhook(paymentId) {
     const channel = await client.channels.fetch(purchase.channel_id).catch(() => null);
     if (channel?.isTextBased()) {
       await channel.send(
-        `✅ Pagamento aprovado!\n🧾 Pedido: **${orderId}**\n🧾 PaymentId: **${paymentId}**\n🚀 Entregando **${purchase.coins} coins** no jogo...`
+        `✅ Pagamento aprovado!\n🧾 Pedido: **${orderId}**\n🧾 PaymentId: **${paymentId}**\n🚀 Entregando **${purchase.coins} coins**...`
       ).catch(() => {});
     }
 
@@ -583,7 +584,6 @@ async function processPaymentFromWebhook(paymentId) {
 
       if (channel?.isTextBased()) {
         await channel.send("🎉 **Coins entregues com sucesso!**").catch(() => {});
-        await channel.send(`🔒 Fechando ticket em ${Math.floor(CONFIG.AUTO_CLOSE_AFTER_DELIVERY_MS / 1000)}s...`).catch(() => {});
         cleanupChannelState(channel.id);
         setTimeout(() => channel.delete().catch(() => {}), CONFIG.AUTO_CLOSE_AFTER_DELIVERY_MS);
       }
@@ -595,19 +595,6 @@ async function processPaymentFromWebhook(paymentId) {
       payment_id: String(paymentId),
       status: "DELIVERY_ERROR",
       updated_at: now(),
-    });
-
-    await sendPurchaseLog({
-      status: "DELIVERY_ERROR",
-      buyerId: purchase.buyer_id,
-      nick: purchase.nick,
-      email: purchase.email,
-      packId: purchase.pack_id,
-      coins: purchase.coins,
-      amount: purchase.amount,
-      orderId,
-      paymentId: String(paymentId),
-      timestamp: now(),
     });
 
     if (channel?.isTextBased()) {
@@ -628,18 +615,14 @@ function buildPanelMessage() {
     .setDescription(
       "**Compre Coins com segurança e entrega automática.**\n\n" +
       "✅ **1 Coin = R$ 1,00**\n" +
-      "💳 **Pagamento:** Mercado Pago (Checkout Pro)\n" +
+      "💳 **Pagamento:** Mercado Pago\n" +
       "⚡ **Entrega:** automática após aprovação\n\n" +
       "Clique no botão abaixo para abrir um ticket."
     )
     .setFooter({ text: "Sistema automático • Seguro • Profissional" });
 
   const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId("open_ticket")
-      .setLabel("Abrir Ticket")
-      .setStyle(ButtonStyle.Primary)
-      .setEmoji("🎟️")
+    new ButtonBuilder().setCustomId("open_ticket").setLabel("Abrir Ticket").setStyle(ButtonStyle.Primary).setEmoji("🎟️")
   );
 
   return { embeds: [embed], components: [row] };
@@ -651,15 +634,12 @@ function buildPackRows(disabled = false) {
 
   for (const p of PACKS) {
     const price = calculatePriceBRL(p);
-    const label = `${p.coins} coins (${brl(price)})`;
-
     const btn = new ButtonBuilder()
       .setCustomId(`pack:${p.id}`)
-      .setLabel(label)
+      .setLabel(`${p.coins} coins (${brl(price)})`)
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(disabled);
 
-    // emoji separado (pra não “sumir”)
     if (p.emoji) btn.setEmoji(p.emoji);
 
     if (current.components.length >= 5) {
@@ -668,16 +648,11 @@ function buildPackRows(disabled = false) {
     }
     current.addComponents(btn);
   }
-
   if (current.components.length) rows.push(current);
 
   rows.push(
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId("close_ticket")
-        .setLabel("Fechar Ticket")
-        .setStyle(ButtonStyle.Danger)
-        .setEmoji("🔒")
+      new ButtonBuilder().setCustomId("close_ticket").setLabel("Fechar Ticket").setStyle(ButtonStyle.Danger).setEmoji("🔒")
     )
   );
 
@@ -687,11 +662,7 @@ function buildPackRows(disabled = false) {
 async function sendOrEditPanel() {
   const guild = await client.guilds.fetch(CONFIG.GUILD_ID);
   const channel = await guild.channels.fetch(CONFIG.PANEL_CHANNEL_ID).catch(() => null);
-
-  if (!channel || !channel.isTextBased()) {
-    console.log("❌ PANEL_CHANNEL_ID não é um canal de texto válido.");
-    return;
-  }
+  if (!channel || !channel.isTextBased()) return;
 
   const payload = buildPanelMessage();
 
@@ -750,12 +721,9 @@ async function rebuildOpenTicketsCache(guild) {
 // ===================== PERMISSÃO FECHAR =====================
 function canCloseTicket(interaction, buyerId) {
   if (buyerId && interaction.user.id === buyerId) return true;
-
   const member = interaction.member;
   if (!member) return false;
-
   if (member.permissions?.has(PermissionFlagsBits.ManageChannels)) return true;
-
   if (CONFIG.SUPPORT_ROLE_ID) {
     try {
       if (member.roles?.cache?.has(CONFIG.SUPPORT_ROLE_ID)) return true;
@@ -784,9 +752,7 @@ async function createTicketChannel({ guild, user }) {
   }
 
   const genKey = `GEN:${user.id}`;
-  if (STATE.generatingTicket.has(genKey)) {
-    return { ok: false, reason: "Estou criando seu ticket… aguarde um instante e tente de novo." };
-  }
+  if (STATE.generatingTicket.has(genKey)) return { ok: false, reason: "Estou criando seu ticket… tente novamente." };
   STATE.generatingTicket.add(genKey);
 
   try {
@@ -830,7 +796,6 @@ async function createTicketChannel({ guild, user }) {
       parent: category.id,
       topic: buildTopic(topicObj),
       permissionOverwrites: overwrites,
-      reason: `Ticket aberto por ${user.tag} (${user.id})`,
     });
 
     STATE.openTickets.set(user.id, channel.id);
@@ -846,8 +811,7 @@ async function createTicketChannel({ guild, user }) {
         "**Passo 3:** Clique no pack para gerar o **link de pagamento**\n\n" +
         `📌 Nick salvo: **${topicObj.nick || "—"}**\n` +
         `📌 Email salvo: **${topicObj.email || "—"}**`
-      )
-      .setFooter({ text: "Ao gerar um link, os packs travam até o pagamento." });
+      );
 
     const menuMsg = await channel.send({ embeds: [embed], components: buildPackRows(false) });
     topicObj.menuMsgId = menuMsg.id;
@@ -856,7 +820,7 @@ async function createTicketChannel({ guild, user }) {
     return { ok: true, channelId: channel.id };
   } catch (e) {
     console.log("❌ createTicketChannel erro:", e?.message || e);
-    return { ok: false, reason: "Não consegui criar o ticket (erro interno)." };
+    return { ok: false, reason: "Erro interno ao criar ticket." };
   } finally {
     STATE.generatingTicket.delete(genKey);
   }
@@ -869,11 +833,11 @@ async function closeTicketChannel(channel, reasonText = "Ticket fechado.") {
   setTimeout(() => channel.delete().catch(() => {}), CONFIG.DELETE_DELAY_MS);
 }
 
-// ===================== LOCK POR TICKET (PACK) =====================
+// ===================== LOCK PACK =====================
 function acquirePackLock(channelId, byUserId) {
   const t = now();
   const cur = STATE.packLocks.get(channelId);
-  if (cur && cur.until > t) return { ok: false, waitMs: cur.until - t, by: cur.by };
+  if (cur && cur.until > t) return { ok: false, waitMs: cur.until - t };
   STATE.packLocks.set(channelId, { until: t + CONFIG.PACK_LOCK_MS, by: byUserId });
   return { ok: true };
 }
@@ -884,14 +848,9 @@ function releasePackLock(channelId) {
 // ===================== BUTTON HANDLER =====================
 async function handleButton(interaction) {
   const { ensureDefer, respond } = createSafeResponder(interaction);
-
-  // SEMPRE tenta defer primeiro (pra não “pensando infinito”)
   await ensureDefer();
 
-  // dedupe (depois do defer)
-  if (markAndCheckDuplicate(interaction.id)) {
-    return respond("⏳ Já estou processando essa ação…");
-  }
+  if (markAndCheckDuplicate(interaction.id)) return respond("⏳ Já estou processando isso…");
 
   try {
     const customId = interaction.customId;
@@ -917,7 +876,7 @@ async function handleButton(interaction) {
     const isBuyer = buyerId && interaction.user.id === buyerId;
 
     if (customId === "close_ticket") {
-      if (!canCloseTicket(interaction, buyerId)) return respond("⚠️ Você não tem permissão para fechar este ticket.");
+      if (!canCloseTicket(interaction, buyerId)) return respond("⚠️ Sem permissão para fechar este ticket.");
       await respond("🔒 Fechando em instantes...");
       await closeTicketChannel(channel, "Ticket fechado.");
       return;
@@ -927,21 +886,14 @@ async function handleButton(interaction) {
       if (!isBuyer) return respond("⚠️ Só quem abriu o ticket pode escolher o pack.");
 
       const lock = acquirePackLock(channel.id, interaction.user.id);
-      if (!lock.ok) {
-        const s = Math.ceil(lock.waitMs / 1000);
-        return respond(`⏳ Aguarde ${s}s… já existe uma ação em andamento neste ticket.`);
-      }
+      if (!lock.ok) return respond(`⏳ Aguarde ${Math.ceil(lock.waitMs / 1000)}s…`);
 
       try {
         await respond("⏳ Gerando link de pagamento...");
 
         const pending = stmtFindPendingInChannel.get(channel.id);
         if (pending) {
-          return respond(
-            `⚠️ Já existe um pedido **pendente** neste ticket.\n` +
-            `🧾 orderId: **${pending.order_id}**\n` +
-            `Aguarde o pagamento para liberar novos packs.`
-          );
+          return respond(`⚠️ Já existe pedido pendente neste ticket.\n🧾 orderId: **${pending.order_id}**`);
         }
 
         const packId = customId.split(":")[1];
@@ -955,14 +907,7 @@ async function handleButton(interaction) {
 
         const orderId = makeOrderId(interaction.user.id);
 
-        let pref;
-        try {
-          pref = await createCheckoutPreference({ pack, buyerId: interaction.user.id, nick, email, orderId });
-        } catch (e) {
-          console.log("❌ MP createPreference erro:", e?.response?.data || e?.message || e);
-          return respond("❌ Não consegui gerar o link de pagamento agora (Mercado Pago).");
-        }
-
+        const pref = await createCheckoutPreference({ pack, buyerId: interaction.user.id, nick, email, orderId });
         const payLink = String(pref?.init_point || "");
         if (!payLink) return respond("❌ Mercado Pago não retornou o link (init_point).");
 
@@ -987,15 +932,12 @@ async function handleButton(interaction) {
         topicObj.orderId = orderId;
         await channel.setTopic(buildTopic(topicObj)).catch(() => {});
 
-        // desabilita botões (menu)
         const menuMsgId = String(topicObj.menuMsgId || "").trim();
         if (menuMsgId) {
           try {
             const menuMsg = await channel.messages.fetch(menuMsgId);
             await menuMsg.edit({ components: buildPackRows(true) });
-          } catch {
-            await channel.send({ content: "🔒 Packs bloqueados (aguardando pagamento).", components: buildPackRows(true) }).catch(() => {});
-          }
+          } catch {}
         }
 
         await channel.send(
@@ -1027,7 +969,7 @@ async function handleButton(interaction) {
       }
     }
 
-    return respond("⚠️ Botão desconhecido. Use o painel novamente.");
+    return respond("⚠️ Botão desconhecido.");
   } catch (err) {
     console.error("❌ handleButton crash:", err);
     return respond("❌ Erro interno ao processar o botão.");
@@ -1037,21 +979,15 @@ async function handleButton(interaction) {
 // ===================== COMMAND HANDLER =====================
 async function handleCommand(interaction) {
   const { ensureDefer, respond } = createSafeResponder(interaction);
-
-  // sempre defer no começo
   await ensureDefer();
 
-  // dedupe depois do defer
-  if (markAndCheckDuplicate(interaction.id)) {
-    return respond("⏳ Já estou processando esse comando…");
-  }
+  if (markAndCheckDuplicate(interaction.id)) return respond("⏳ Já estou processando esse comando…");
 
   try {
     console.log("[CMD]", interaction.commandName, "by", interaction.user.id, "in", interaction.channelId);
 
     if (interaction.commandName === "setemail") {
       const email = interaction.options.getString("email", true).trim();
-
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return respond("❌ Email inválido.");
 
       const current = stmtGetProfile.get(interaction.user.id) || { nick: "", email: "" };
@@ -1062,7 +998,6 @@ async function handleCommand(interaction) {
         updated_at: now(),
       });
 
-      // se estiver em ticket e for buyer, atualiza topic
       if (interaction.channel && isTicketChannel(interaction.channel)) {
         const topicObj = parseTopic(interaction.channel.topic || "");
         if (String(topicObj.buyer || "") === interaction.user.id) {
@@ -1123,7 +1058,6 @@ client.on("messageCreate", async (msg) => {
     const text = String(msg.content || "").trim();
     if (!text) return;
 
-    // salvar nick (se não tiver)
     const nickTopic = String(topicObj.nick || "").trim();
     if (!nickTopic) {
       const nick = text;
@@ -1141,7 +1075,6 @@ client.on("messageCreate", async (msg) => {
       return;
     }
 
-    // salvar email (se não tiver)
     const emailTopic = String(topicObj.email || "").trim();
     const looksEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text);
     if (!emailTopic && looksEmail) {
@@ -1171,11 +1104,6 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.isChatInputCommand()) return await handleCommand(interaction);
   } catch (e) {
     console.error("❌ interactionCreate crash:", e);
-    try {
-      const { ensureDefer, respond } = createSafeResponder(interaction);
-      await ensureDefer();
-      await respond("❌ Erro interno inesperado.");
-    } catch {}
   }
 });
 
@@ -1210,7 +1138,7 @@ function startWebhookServer() {
   app.get("/health", (_, res) => res.json({ ok: true }));
 
   app.post("/mp/webhook", async (req, res) => {
-    res.sendStatus(200); // responde rápido
+    res.sendStatus(200);
 
     try {
       const dataId = String(req.body?.data?.id || req.query["data.id"] || req.query.id || "");
