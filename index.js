@@ -287,14 +287,14 @@ function createSafeResponder(interaction) {
     watchdog = setTimeout(async () => {
       if (finished) return;
       finished = true;
-
       try {
         if (interaction.deferred || interaction.replied || acked) {
           await interaction.editReply({ content: "⚠️ Demorei para responder. Tente novamente agora." }).catch(() => {});
         } else {
-          await interaction
-            .reply({ content: "⚠️ Demorei para responder. Tente novamente agora.", flags: MessageFlags.Ephemeral })
-            .catch(() => {});
+          await interaction.reply({
+            content: "⚠️ Demorei para responder. Tente novamente agora.",
+            flags: MessageFlags.Ephemeral,
+          }).catch(() => {});
         }
       } catch {
         await channelFallback("Demorei para responder. Tente novamente.");
@@ -310,9 +310,8 @@ function createSafeResponder(interaction) {
   async function ack() {
     if (interaction.deferred || interaction.replied || acked || triedAck) return;
     triedAck = true;
-
     try {
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral }); // ACK cedo
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       acked = true;
       startWatchdog();
     } catch (e) {
@@ -328,12 +327,24 @@ function createSafeResponder(interaction) {
         await channelFallback("o comando expirou antes de eu responder. Tente novamente.");
         return;
       }
-
       console.log("⚠️ deferReply falhou:", code, msg);
-      await channelFallback("falha ao reconhecer o comando. Veja os logs.");
+      await channelFallback("falha ao reconhecer a ação. Veja os logs.");
     }
   }
 
+  // ✅ PROGRESSO: não marca como finished
+  async function progress(content) {
+    const text = String(content ?? "");
+    try {
+      if (interaction.deferred || interaction.replied || acked) {
+        await interaction.editReply({ content: text }).catch(() => {});
+      } else {
+        await interaction.reply({ content: text, flags: MessageFlags.Ephemeral }).catch(() => {});
+      }
+    } catch {}
+  }
+
+  // ✅ FINAL: marca finished
   async function done(content) {
     if (finished) return;
     finished = true;
@@ -341,54 +352,30 @@ function createSafeResponder(interaction) {
 
     const text = String(content ?? "");
 
-    if (interaction.deferred || interaction.replied || acked) {
-      try {
-        await interaction.editReply({ content: text });
-        return;
-      } catch (e) {
-        const code = e?.code;
-        const msg = String(e?.message || "");
-
-        if (code === 10062 || msg.includes("Unknown interaction")) {
-          await channelFallback(text);
-          return;
-        }
-
-        try {
-          await interaction.followUp({ content: text, flags: MessageFlags.Ephemeral });
-          return;
-        } catch {
-          await channelFallback(text);
-          return;
-        }
-      }
-    }
-
     try {
-      await interaction.reply({ content: text, flags: MessageFlags.Ephemeral });
-      return;
-    } catch (e) {
-      const code = e?.code;
-      const msg = String(e?.message || "");
-
-      if (code === 40060 || msg.includes("already been acknowledged")) {
-        try {
-          await interaction.editReply({ content: text });
-          return;
-        } catch {}
-      }
-      if (code === 10062 || msg.includes("Unknown interaction")) {
-        await channelFallback(text);
+      if (interaction.deferred || interaction.replied || acked) {
+        await interaction.editReply({ content: text }).catch(async () => {
+          await interaction.followUp({ content: text, flags: MessageFlags.Ephemeral }).catch(() => {});
+        });
         return;
       }
 
-      console.log("⚠️ reply falhou:", code, msg);
+      await interaction.reply({ content: text, flags: MessageFlags.Ephemeral }).catch(async (e) => {
+        const msg = String(e?.message || "");
+        if (e?.code === 40060 || msg.includes("already been acknowledged")) {
+          await interaction.editReply({ content: text }).catch(() => {});
+        } else {
+          await interaction.followUp({ content: text, flags: MessageFlags.Ephemeral }).catch(() => {});
+        }
+      });
+    } catch {
       await channelFallback(text);
     }
   }
 
-  return { ack, done };
+  return { ack, progress, done };
 }
+
 
 // ===================== DEDUPE interaction.id =====================
 function isDupInteraction(interactionId) {
@@ -1044,8 +1031,7 @@ async function handleButton(interaction) {
       }
 
       try {
-        await done("⏳ Gerando link de pagamento...");
-
+        await progress("⏳ Gerando link de pagamento...");
         const pending = stmtFindPendingInChannel.get(channel.id);
         if (pending) {
           return await done(
@@ -1114,6 +1100,7 @@ async function handleButton(interaction) {
               `✅ Após aprovação, a entrega será automática.`
           )
           .catch(() => {});
+await done("✅ Link gerado! Veja a mensagem no ticket com o link de pagamento.");
 
         await sendPurchaseLog({
           mode: "PROD",
